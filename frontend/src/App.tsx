@@ -167,7 +167,7 @@ export default function App() {
     }))
   }
 
-  const recordDownloadClick = (activityId: string, activityName: string, fileName: string) => {
+  const recordDownloadClick = (activityId: string, activityName: string, _fileName: string) => {
     setSessions(prev => prev.map(s => {
       if (s.id === currentSessionId) {
         const tracking = s.activityTracking[activityId] || {
@@ -337,47 +337,6 @@ export default function App() {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight })
   }, [messages])
 
-  function renderBlockFromActivity(activity: any): string {
-    if (!activity) return ''
-    const title = activity['Activity Name'] || activity['Title'] || 'Lesson Plan'
-    const time = (activity['Time'] || '').trim()
-
-    const out: string[] = []
-    // H1 with time badge
-    out.push(`# ${title}${time ? `  ⏱️ ${time}` : ''}`)
-
-    const addSection = (label: string, value?: string | null) => {
-      const v = (value || '').trim()
-      if (!v) return
-      out.push(`\n**${label}**`)
-      // turn multi-line chunks into bullets for readability
-      const parts = v.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
-      if (['Materials','Student Materials','Examples','Additional Resources'].includes(label)) {
-        parts.forEach(p => out.push(`- ${p}`))
-      } else if (label === 'Directions') {
-        // keep existing numbering; otherwise number the lines
-        parts.forEach((p, i) => {
-          out.push(/^\d+\./.test(p) ? p : `${i + 1}. ${p}`)
-        })
-      } else {
-        out.push(parts.join(' '))
-      }
-    }
-
-    addSection('Objective', activity['Objective'])
-    addSection('Overview', activity['Introduction'])
-    addSection('Advance Preparation', activity['Advance preparation'])
-    addSection('Materials', activity['Materials'] || activity['Materials Needed'])
-    addSection('Student Materials', activity['Student Materials'])
-    addSection('Directions', activity['Directions'])
-    addSection('Examples', activity['Examples'])   // 👈 Render examples as bullets in chat
-    addSection('Additional Resources', activity['Additional Resources'])
-    if ((activity['Source Link'] || '').trim()) {
-      out.push(`\n**Source**\n${activity['Source Link'].trim()}`)
-    }
-
-    return out.join('\n').trim()
-  }
 
   async function send() {
     const text = input.trim()
@@ -400,7 +359,7 @@ export default function App() {
       // All requests go through the unified /chat endpoint (including modifications)
       const r = await chat(session, text)
       // Merge session data instead of replacing it completely
-      setSession(prev => ({ ...prev, ...r.session }))
+      setSession((prev: any) => ({ ...prev, ...r.session }))
       const resp = r.response
       
       // Update session state with the latest session data from backend
