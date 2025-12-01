@@ -1,0 +1,1585 @@
+# processing/document_processor.py
+"""
+Document processing and generation
+"""
+import io
+import re
+import hashlib
+import json
+from typing import Dict, Tuple, List, Any
+from dataclasses import dataclass, field
+from docx import Document
+from docx.shared import Inches
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from services.ai_services import openai_service
+from data.processor import data_processor
+
+# ===== Time-aware processing helpers =====
+
+def _parse_minutes(value: str | None) -> int | None:
+    if not value:
+        return None
+    import re
+    m = re.search(r"(\d{1,3})\s*(?:min|mins|minutes?|hr|hrs|hour|hours)", str(value).lower())
+    if not m:
+        return None
+    n = int(m.group(1))
+    if "hr" in value.lower() or "hour" in value.lower():
+        n *= 60
+    return n
+
+def _count_steps(directions: str) -> int:
+    if not directions:
+        return 0
+    # count numbered lines like "1." and also plain lines as a fallback
+    import re
+    nums = re.findall(r"^\s*\d+\.", directions, flags=re.M)
+    if nums:
+        return len(nums)
+    lines = [ln.strip() for ln in directions.splitlines() if ln.strip()]
+    return len(lines)
+
+def _clamp(n: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, n))
+
+def _norm_text(s: str) -> str:
+    """Normalize text for duplicate detection"""
+    s = re.sub(r"\s+", " ", (s or "").strip().lower())
+    return s
+
+def _hash_text(s: str) -> str:
+    """Generate hash for duplicate detection"""
+    return hashlib.sha1(_norm_text(s).encode("utf-8")).hexdigest()
+
+@dataclass
+class Activity:
+    """Structured activity with sections instead of blobs"""
+    id: str
+    title: str
+    time_minutes: int | None = None
+    sections: Dict[str, Any] = field(default_factory=lambda: {
+        "intro": "",
+        "objectives": [],
+        "materials": [],
+        "directions": [],
+        "examples": [],
+        "discussion_questions": [],
+        "assessment": [],
+        "notes": ""
+    })
+    meta: Dict[str, Any] = field(default_factory=dict)
+    version: int = 1
+
+    # ---------- idempotent upserts ----------
+    def upsert_text_section(self, key: str, text: str) -> None:
+        """Replace a single-string section."""
+        self.sections[key] = (text or "").strip()
+        self.version += 1
+
+    def upsert_list_section(self, key: str, items: List[str]) -> None:
+        """
+        Merge into a list section, deduplicating by normalized hash.
+        If the section is meant to be *replaced* entirely, call replace_list_section().
+        """
+        existing = [x for x in (self.sections.get(key) or []) if isinstance(x, str)]
+        seen = {_hash_text(x) for x in existing}
+        out = existing[:]
+        for it in (items or []):
+            h = _hash_text(it)
+            if h not in seen:
+                out.append(it.strip())
+                seen.add(h)
+        self.sections[key] = out
+        self.version += 1
+
+    def replace_list_section(self, key: str, items: List[str]) -> None:
+        """Replace an entire list section (idempotent)."""
+        # still dedupe within the incoming list
+        seen, out = set(), []
+        for it in (items or []):
+            h = _hash_text(it)
+            if h not in seen:
+                out.append(it.strip())
+                seen.add(h)
+        self.sections[key] = out
+        self.version += 1
+
+    # ---------- rendering ----------
+    def to_markdown(self) -> str:
+        """Render to markdown for the chat/preview layer."""
+        lines = []
+        title_line = f"# {self.title}"
+        if self.time_minutes:
+            title_line += f"  ⏱️ {self.time_minutes} min"
+        lines.append(title_line)
+
+        if self.sections.get("intro"):
+            lines.append(f"\n**Overview**\n{self.sections['intro']}")
+
+        def add_list(name, key):
+            vals = self.sections.get(key) or []
+            if vals:
+                lines.append(f"\n**{name}**")
+                for v in vals:
+                    lines.append(f"- {v}")
+
+        add_list("Objectives", "objectives")
+        add_list("Materials", "materials")
+        add_list("Directions", "directions")
+        add_list("Examples", "examples")
+        add_list("Discussion Questions", "discussion_questions")
+        add_list("Assessment", "assessment")
+
+        if self.sections.get("notes"):
+            lines.append(f"\n**Notes**\n{self.sections['notes']}")
+
+        return "\n".join(lines)
+
+def strip_added_headers(text: str) -> str:
+    """Remove repeated 'Added to X / Added Content' banners from legacy content."""
+    text = re.sub(r"(#+\s*)?Added to .*?\n", "", text, flags=re.I)
+    text = re.sub(r"(#+\s*)?Added Content:?[\s\n]*", "", text, flags=re.I)
+    return text
+
+def parse_legacy_activity(legacy: Dict[str, Any]) -> Activity:
+    """
+    Convert current activity dicts into a structured Activity.
+    Handles typical keys like 'Time', 'Time to implement', 'Materials Needed', 'Directions', etc.
+    """
+    title = legacy.get("title") or legacy.get("Strategic Action") or "Untitled Activity"
+    raw_time = legacy.get("Time") or legacy.get("Time to implement") or ""
+    time_minutes = None
+    m = re.search(r"(\d{1,3})\s*min", str(raw_time).lower())
+    if m:
+        time_minutes = int(m.group(1))
+
+    act = Activity(
+        id=str(legacy.get("id") or hashlib.md5(title.encode()).hexdigest()),
+        title=title,
+        time_minutes=time_minutes,
+        meta={"source": "legacy"}
+    )
+
+    # naive splits; replace with your own robust parsing if available
+    mats = legacy.get("Materials") or legacy.get("Materials Needed") or ""
+    dirs = legacy.get("Directions") or legacy.get("Steps") or ""
+    exs  = legacy.get("Examples") or ""
+
+    def split_bullets(text: str) -> List[str]:
+        if not text:
+            return []
+        parts = re.split(r"(?:^\s*[-•]\s+|\n\s*[-•]\s+)", text.strip(), flags=re.M)
+        return [p.strip() for p in parts if p.strip()]
+
+    def split_steps(text: str) -> List[str]:
+        if not text:
+            return []
+        # handles "1. …" lists or line breaks
+        parts = re.split(r"(?:^\s*\d+\.\s+|\n\s*\d+\.\s+)", text.strip(), flags=re.M)
+        return [p.strip() for p in parts if p.strip()]
+
+    act.upsert_text_section("intro", legacy.get("Overview") or legacy.get("Description") or "")
+    act.replace_list_section("materials", split_bullets(mats))
+    act.replace_list_section("directions", split_steps(dirs))
+    if isinstance(exs, str):
+        act.replace_list_section("examples", split_bullets(exs))
+    elif isinstance(exs, list):
+        act.replace_list_section("examples", exs)
+
+    return act
+
+class DocumentProcessor:
+    """Handles document generation and processing"""
+    
+    def __init__(self):
+        pass
+
+    def _extract_bullets_from_instruction(self, instruction: str) -> list[str]:
+        """Collect example-like lines the user typed (bullets or lines under an 'Examples' header)."""
+        import re as _re
+        raw = (instruction or "").strip()
+        if not raw:
+            return []
+
+        lines = [l.strip() for l in raw.splitlines()]
+        out: list[str] = []
+        in_examples = False
+
+        for l in lines:
+            if not l:
+                in_examples = False
+                continue
+
+            # Enter "Examples" block (accept subsequent non-empty lines as items)
+            if _re.match(r"^\s*examples?\s*:?\s*$", l, flags=_re.I):
+                in_examples = True
+                continue
+
+            # Accept bullets anywhere, or plain lines only if we're inside an Examples block
+            m = _re.match(r"^\s*[•\-–]\s*(.+)$", l)
+            if m:
+                cand = m.group(1).strip()
+            elif in_examples:
+                cand = l.strip()
+            else:
+                cand = ""
+
+            if not cand:
+                continue
+
+            # Filter out imperative/request lines
+            if _re.search(r"\b(give|add|list|provide|suggest|show|generate|create)\b", cand, _re.I):
+                continue
+
+            if 2 <= len(cand) <= 140:
+                out.append(_re.sub(r"\s+", " ", cand))
+
+        return out
+
+    def _generate_examples_dyn(self, activity: Dict[str, Any], instruction: str) -> list[str]:
+        """
+        Ask the model to infer *what kind* of examples are appropriate for this activity
+        (e.g., emotion words for Mood Meter, prompts for Bingo, reflection stems, etc.)
+        and return only examples as a JSON list. No hard-coded content.
+        """
+        title = (activity.get("Activity Name") or activity.get("Title") or "").strip()
+        objective = (activity.get("Objective") or "").strip()
+        directions = (activity.get("Directions") or "").strip()
+        materials = (activity.get("Materials") or "").strip()
+        time_ = (activity.get("Time") or "").strip()
+
+        # Keep this prompt generic; the model infers category (emotions, prompts, etc.).
+        prompt = f"""
+Return ONLY JSON with this shape (no prose):
+{{"examples": ["...","...","..."]}}
+
+Task: Generate compact, classroom-friendly EXAMPLES that fit the activity.
+- Infer the correct kind of examples from the context (e.g., emotion words for a Mood Meter check-in,
+  bingo prompts for 'Classmate Bingo', discussion stems if the activity asks for questions, etc.).
+- Keep each example short and concrete (2–6 words for terms; 4–12 words for prompts).
+- Adapt to grade level and time implicitly if present (shorter if 5–10 min; more variety if 30–60 min).
+
+Context:
+Title: {title}
+Time: {time_}
+Objective: {objective[:800]}
+Directions: {directions[:1200]}
+Materials: {materials[:600]}
+
+User instruction: {instruction}
+""".strip()
+
+        try:
+            raw = openai_service.chat([
+                {"role":"system","content":"You produce only strict JSON for examples with key 'examples'."},
+                {"role":"user","content":prompt}
+            ], max_tokens=400, temperature=0.2)
+            data = json.loads(raw)
+            xs = data.get("examples") if isinstance(data, dict) else None
+            if isinstance(xs, list):
+                # normalize whitespace
+                return [re.sub(r"\s+", " ", str(x)).strip() for x in xs if str(x).strip()]
+        except Exception:
+            pass
+        return []
+    
+    def legacy_to_markdown(self, activity: Dict[str, str]) -> str:
+        """Render a legacy activity dict to clean markdown for chat display."""
+        a = activity or {}
+        title = (a.get("Activity Name") or a.get("Title") or "Lesson Plan").strip()
+        time_ = (a.get("Time") or "").strip()
+        objective = (a.get("Objective") or "").strip()
+        materials = (a.get("Materials") or a.get("Materials Needed") or "").strip()
+        student_mats = (a.get("Student Materials") or "").strip()
+        intro = (a.get("Introduction") or "").strip()
+        prep = (a.get("Advance preparation") or "").strip()
+        directions = (a.get("Directions") or "").strip()
+        examples = (a.get("Examples") or "").strip()
+        resources = (a.get("Additional Resources") or "").strip()
+        source = (a.get("Source Link") or "").strip()
+
+        lines = []
+        h = f"# {title}"
+        if time_:
+            h += f"  ⏱️ {time_}"
+        lines.append(h)
+
+        if objective:
+            lines.append("\n**Objective**")
+            lines.append(objective)
+
+        if intro:
+            lines.append("\n**Overview**")
+            lines.append(intro)
+
+        if prep:
+            lines.append("\n**Advance Preparation**")
+            lines.append(prep)
+
+        if materials:
+            lines.append("\n**Materials**")
+            # split on newlines or semicolons for bullets
+            parts = [p.strip() for p in re.split(r"[;\n]+", materials) if p.strip()]
+            lines.extend([f"- {p}" for p in parts] or [materials])
+
+        if student_mats:
+            lines.append("\n**Student Materials**")
+            parts = [p.strip() for p in re.split(r"[;\n]+", student_mats) if p.strip()]
+            lines.extend([f"- {p}" for p in parts] or [student_mats])
+
+        if directions:
+            lines.append("\n**Directions**")
+            # keep existing numbering if present; otherwise split lines as bullets
+            step_lines = [s.strip() for s in directions.splitlines() if s.strip()]
+            # ensure markdown numbers
+            for i, s in enumerate(step_lines, 1):
+                if re.match(r"^\d+\.", s):
+                    lines.append(s)
+                else:
+                    lines.append(f"{i}. {s}")
+
+        if examples:
+            lines.append("\n**Examples**")
+            # split on newlines or semicolons for bullets
+            parts = [p.strip() for p in re.split(r"[\n;]+", examples) if p.strip()]
+            lines.extend([f"- {p}" for p in parts] or [examples])
+
+        if resources:
+            lines.append("\n**Additional Resources**")
+            lines.append(resources)
+
+        if source:
+            lines.append("\n**Source**")
+            lines.append(source)
+
+        return "\n".join(lines).strip()
+    
+    def make_directions(self, page_text: str, activity_title: str, activity_data: dict = None) -> str:
+        """Generate teaching directions using AI"""
+        if not page_text.strip():
+            # If no source material, generate directions based on activity data
+            if activity_data:
+                return self._generate_directions_from_activity_data(activity_title, activity_data)
+            else:
+                return "No source material available for generating directions."
+        
+        prompt = f"""
+        You are an expert teacher creating clear, step-by-step directions for a classroom activity.
+        
+        Activity: {activity_title}
+        
+        Source material:
+        {page_text[:2000]}
+        
+        Create detailed, actionable directions that a teacher can follow. Include:
+        
+        **Materials Needed:**
+        - List all required materials and supplies
+        
+        **Directions:**
+        1. First step
+           a. Sub-step
+           b. Sub-step
+        2. Second step
+           etc.
+        
+        Make it practical and classroom-ready with clear materials list.
+        """
+        
+        try:
+            return openai_service.chat([
+                {"role": "system", "content": "You are an expert teacher creating clear classroom directions."},
+                {"role": "user", "content": prompt}
+            ], max_tokens=1500, temperature=0.3)
+        except Exception:
+            return "Error generating directions. Please refer to source material."
+    
+    def _generate_directions_from_activity_data(self, activity_title: str, activity_data: dict) -> str:
+        """Generate directions when no source material is available"""
+        try:
+            # Extract relevant information from activity data
+            objective = activity_data.get("Objective", "")
+            materials = activity_data.get("Materials", "")
+            time = activity_data.get("Time", "")
+            notes = activity_data.get("Notes", "")
+            short_desc = activity_data.get("Short Description", "")
+            
+            # Build context from available data
+            context_parts = []
+            if objective:
+                context_parts.append(f"Objective: {objective}")
+            if short_desc:
+                context_parts.append(f"Description: {short_desc}")
+            if notes:
+                context_parts.append(f"Notes: {notes}")
+            if time:
+                context_parts.append(f"Time: {time}")
+            if materials:
+                context_parts.append(f"Materials: {materials}")
+            
+            context = "\n".join(context_parts)
+            
+            prompt = f"""
+            You are an expert teacher creating clear, step-by-step directions for a classroom activity.
+            
+            Activity: {activity_title}
+            
+            Available information:
+            {context}
+            
+            Create detailed, actionable directions that a teacher can follow. Include:
+            
+            **Materials Needed:**
+            - List all required materials and supplies
+            
+            **Directions:**
+            1. First step
+               a. Sub-step
+               b. Sub-step
+            2. Second step
+               etc.
+            
+            Make it practical and classroom-ready with clear materials list.
+            """
+            
+            from services.ai_services import openai_service
+            return openai_service.chat([
+                {"role": "system", "content": "You are an expert teacher creating clear classroom directions."},
+                {"role": "user", "content": prompt}
+            ], max_tokens=1500, temperature=0.3)
+            
+        except Exception as e:
+            return f"Error generating directions from activity data: {str(e)[:100]}..."
+    
+    def autofill_from_directions(self, activity: Dict[str, str]):
+        """Auto-fill activity fields from generated directions using original chatbot logic"""
+        directions = activity.get("Directions", "").strip()
+        if not directions or directions.lower().startswith("no ready-made directions"):
+            return
+        
+        # Extract core steps (remove step numbers and markdown headers)
+        core = []
+        for line in directions.splitlines():
+            line = line.strip()
+            if line and not line.startswith("**") and not line.startswith("#"):
+                core.append(re.sub(r"^step\d+:\s*", "", line, flags=re.I))
+        
+        # Auto-fill Objective if missing
+        if not activity.get("Objective", "").strip():
+            # First try to find explicit objective section
+            objective_match = re.search(r"(?:objective|goal|purpose)[:\s]+(.+?)(?:\n|$)", directions, re.I)
+            if objective_match:
+                activity["Objective"] = objective_match.group(1).strip()
+            else:
+                # Fallback to extracting from first pedagogical step
+                prep = re.compile(r"\b(prepare|set ?up|setup|collect|gather|obtain|print|hand ?out|distribute|materials?)\b", re.I)
+                pedagogical = next((c for c in core if not prep.search(c)), core[0] if core else "")
+                sent = self._coerce_students_will(pedagogical)
+                if sent:
+                    activity["Objective"] = re.sub(r"\s+to (the )?(class|students)\b", "", sent, flags=re.I).strip()
+        
+        # Auto-fill Materials if missing
+        if not activity.get("Materials", "").strip():
+            # First try to find explicit materials section
+            materials_match = re.search(r"(?:materials|supplies|needed)[:\s]+(.+?)(?:\n|$)", directions, re.I)
+            if materials_match:
+                activity["Materials"] = materials_match.group(1).strip()
+            else:
+                # Fallback to extracting from steps
+                mat_hint = re.compile(r"\b(gather|obtain|need|materials?|supplies?|use|have|bring|print|prepare|distribute|handouts?)\b", re.I)
+                whitelist = re.compile(r"\b(worksheet|handout|paper|journal|pen|pencil|marker|scissors|glue|post-its?|cards?|dice|ruler|projector|screen|laptop|tablet|device|paint|brush|tape|chart|poster|sticky notes?|game pieces|small toys|trinkets|board games|monopoly)\b", re.I)
+                items = []
+                for c in core[:12]:
+                    if mat_hint.search(c):
+                        for p in re.split(r"[;,•\-–]\s+|\s+and\s+", c):
+                            p = re.sub(r"^(have|gather|obtain|use|bring|print|prepare|distribute)\s+", "", p.strip(), flags=re.I)
+                            if whitelist.search(p):
+                                p = re.sub(r"\s+for\b.*$", "", p, flags=re.I)
+                                p = re.split(r"[.?!]", p)[0].strip(" .")
+                                if 2 <= len(p) <= 60:
+                                    items.append(p)
+                if items:
+                    seen, uniq = set(), []
+                    for it in items:
+                        k = it.lower()
+                        if k not in seen:
+                            seen.add(k)
+                            uniq.append(it)
+                    activity["Materials"] = "; ".join(uniq)
+    
+    def _coerce_students_will(self, sentence: str) -> str:
+        """Convert sentence to 'Students will...' format"""
+        if not sentence:
+            return ""
+        
+        # Verb mapping from original chatbot
+        verb_map = {
+            "introduce": "explore", "explain": "explain", "discuss": "discuss", 
+            "outline": "outline", "plan": "plan", "design": "design", 
+            "brainstorm": "brainstorm", "reflect": "reflect on", "create": "create", 
+            "analyze": "analyze", "identify": "identify", "practice": "practice", 
+            "share": "share"
+        }
+        determiners = ("the ", "a ", "an ", "this ", "that ", "these ", "those ")
+        
+        def normalize_verb_lead(phrase: str) -> str:
+            s = phrase.strip().rstrip(" .,:;")
+            if not s:
+                return ""
+            if s.lower().startswith(determiners):
+                return "learn about " + s
+            first = s.split()[0]
+            if re.match(r"^[A-Za-z]+ing\b", first):
+                return "work on " + s
+            m = re.match(r"^([A-Za-z]+)\b(.*)$", s)
+            if m and m.group(1).lower() in verb_map:
+                return f"{verb_map[m.group(1).lower()]} {m.group(2).strip()}".strip()
+            return s
+        
+        s = re.sub(r"\byour students\b", "students", sentence, flags=re.I)
+        s = re.sub(r"\byour class\b", "the class", s, flags=re.I)
+        s = re.split(r"(?<=[.?!])\s+", s.strip())[0].strip(":;,. ")
+        s = normalize_verb_lead(s)
+        if not s:
+            return ""
+        if not re.match(r"(?i)^students?\b", s):
+            s = "Students will " + s
+        s = s[0].upper() + s[1:]
+        return s if s.endswith(".") else s + "."
+    
+    def build_docx(self, activity: Dict[str, str]) -> bytes:
+        """
+        Strategic Action table layout with *forced borders* on all cells
+        and gentle extraction of Materials from Directions if needed.
+        """
+        print("⚙️ Using Strategic Action TABLE builder v2")
+        import inspect, os
+        print("⚙️ build_docx from:", os.path.abspath(__file__))
+        from docx import Document
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
+        from docx.shared import Inches
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        import re as _re
+        import io as _io
+
+        def _clean(s): return (s or "").strip()
+
+        def _strip_md(s: str) -> str:
+            if not s: return ""
+            t = s
+            t = _re.sub(r"```[\s\S]*?```", "", t)                # fenced code
+            t = _re.sub(r"(?m)^\s*#{1,6}\s*", "", t)            # headings
+            t = t.replace("`", "").replace("**","").replace("__","").replace("*","").replace("_","")
+            t = _re.sub(r"(?m)^\s*[•\-–]\s+", "", t)            # bullets
+            t = _re.sub(r"[ \t]+", " ", t)
+            return t.strip()
+
+        def _lines(text: str) -> list[str]:
+            text = _strip_md(text)
+            if not text: return []
+            return [p.strip() for p in _re.split(r"[\n;]+", text) if p.strip()]
+
+        def _parse_steps(act: Dict[str, str]) -> list[tuple[str, str]]:
+            """
+            Return [(title, body)] from Steps or Directions.
+            - Extracts embedded Materials/Student Materials blocks from Directions.
+            - Treats a./b./c. lines as sub-steps of the current step body.
+            - Skips section headers like 'Materials', 'Student Materials', 'Directions'.
+            """
+            out: list[tuple[str, str]] = []
+
+            # If a structured Steps[] exists, prefer it.
+            steps = act.get("Steps")
+            if isinstance(steps, list) and steps:
+                for i, s in enumerate(steps, 1):
+                    title = _clean((s or {}).get("title"))
+                    body  = _clean((s or {}).get("body") or "")
+                    out.append((_strip_md(title) or f"Step {i}", _strip_md(body)))
+                return out
+
+            dirs = _clean(act.get("Directions") or "")
+            if not dirs:
+                return out
+
+            # --- Pull embedded Materials/Student Materials out of Directions ---
+            def _extract_block(label_regex: str, assign_key: str, text: str) -> tuple[str, str]:
+                """Extract a labeled block into act[assign_key], return (new_text, extracted)."""
+                m = _re.search(
+                    rf"(?:^|\n)\s*({label_regex})\s*:?\s*\n([\s\S]+?)(?=\n\s*(Directions|Step|Steps|Introduction|Activity|Teacher|Student|Reflection|Source|Resources|Time)\b|$)",
+                    text,
+                    flags=_re.I,
+                )
+                if not m:
+                    return text, ""
+                block = _clean(m.group(2))
+                if block and not act.get(assign_key):
+                    act[assign_key] = block
+                new_text = (text[:m.start()] + text[m.end():]).strip()
+                return new_text, block
+
+            dirs, _ = _extract_block(r"Student\s+(Materials|Supplies)", "Student Materials", dirs)
+            dirs, _ = _extract_block(r"(Materials\s+Needed|Materials|Teacher\s+Materials)", "Materials", dirs)
+
+            # Drop a bare "Directions:" line if present
+            dirs = _re.sub(r"(?m)^\s*Directions\s*:?\s*$", "", dirs).strip()
+
+            # --- Parse remaining directions into titled steps with sub-steps ---
+            lines = [l.strip() for l in dirs.splitlines() if l.strip()]
+
+            current_title = None
+            current_body_lines: list[str] = []
+
+            banned = {"materials needed", "materials", "student materials", "directions"}
+
+            def _flush():
+                if current_title is not None:
+                    body = "\n".join(current_body_lines).strip()
+                    out.append((current_title, body))
+
+            for ln in lines:
+                # Sub-step like "a. do this"
+                sub = _re.match(r"^[a-zA-Z]\.\s+(.*)$", ln)
+                if sub and current_title is not None:
+                    current_body_lines.append(f"- { _strip_md(sub.group(1)) }")
+                    continue
+
+                # New step patterns
+                m_num_title_body = _re.match(r"^\s*(?:Step\s*)?(\d+)[\.\)]\s*([^:]+?)(?::\s*(.*))?$", ln, flags=_re.I)
+                m_title_body     = _re.match(r"^([^:]+?):\s*(.*)$", ln)
+
+                if m_num_title_body:
+                    _flush()
+                    title = _strip_md(m_num_title_body.group(2))
+                    body  = _strip_md(m_num_title_body.group(3) or "")
+                    if (title or "").strip().lower() in banned:
+                        current_title = None
+                        current_body_lines = []
+                        continue
+                    current_title = title or f"Step {len(out)+1}"
+                    current_body_lines = [body] if body else []
+
+                elif m_title_body:
+                    _flush()
+                    title = _strip_md(m_title_body.group(1))
+                    body  = _strip_md(m_title_body.group(2))
+                    if (title or "").strip().lower() in banned:
+                        current_title = None
+                        current_body_lines = []
+                        continue
+                    current_title = title or f"Step {len(out)+1}"
+                    current_body_lines = [body] if body else []
+
+                else:
+                    # Continuation line of current step
+                    if current_title is None:
+                        current_title = f"Step {len(out)+1}"
+                    current_body_lines.append(_strip_md(ln))
+
+            _flush()
+            return out
+
+        # ---- Collect fields ----
+        name   = _clean(activity.get("Activity Name") or activity.get("Title") or "Lesson Plan")
+        obj    = _clean(activity.get("Objective"))
+        prep   = _clean(activity.get("Preparation Time"))
+        impl   = _clean(activity.get("Implementation Time"))
+        legacy = _clean(activity.get("Time"))
+        teach  = _clean(activity.get("Materials"))
+        stud   = _clean(activity.get("Student Materials"))
+        refl   = _clean(activity.get("Reflection Questions"))
+        src    = _clean(activity.get("Source Link"))
+        resx   = _clean(activity.get("Additional Resources"))
+
+        steps  = _parse_steps(activity)
+
+        # ---- Build doc ----
+        doc = Document()
+        doc.add_heading("Strategic Action", level=0).alignment = WD_ALIGN_PARAGRAPH.LEFT
+        doc.add_heading("Name of the Activity", level=1)
+        doc.add_paragraph(_strip_md(name))
+
+        # Table with forced borders
+        table = doc.add_table(rows=0, cols=2)
+        table.style = "Table Grid"
+        table.alignment = WD_TABLE_ALIGNMENT.LEFT
+        table.autofit = False
+
+        def _force_cell_borders(cell):
+            tc = cell._tc
+            tcPr = tc.get_or_add_tcPr()
+            tcBorders = tcPr.first_child_found_in("w:tcBorders")
+            if tcBorders is None:
+                tcBorders = OxmlElement('w:tcBorders')
+                tcPr.append(tcBorders)
+            for side in ('top','left','bottom','right','insideH','insideV'):
+                tag = OxmlElement(f"w:{side}")
+                tag.set(qn('w:val'), 'single')
+                tag.set(qn('w:sz'), '8')        # border thickness
+                tag.set(qn('w:space'), '0')
+                tag.set(qn('w:color'), '000000')
+                tcBorders.append(tag)
+
+        def add_row(label: str, contents: list[str], bullet: bool = False):
+            row = table.add_row()
+            left, right = row.cells
+            _force_cell_borders(left)
+            _force_cell_borders(right)
+            left.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+            right.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+
+            lp = left.paragraphs[0]; lr = lp.add_run(label); lr.bold = True
+            # set widths on first row
+            if len(table.rows) == 1:
+                try:
+                    left.width  = Inches(2.2)
+                    right.width = Inches(4.8)
+                except Exception:
+                    pass
+
+            if not contents: contents = [""]
+            for i, txt in enumerate(contents):
+                txt = _strip_md(txt)
+                rp = right.paragraphs[0] if (i == 0 and right.paragraphs and right.paragraphs[0].text == "") else right.add_paragraph()
+                if bullet:
+                    rp.style = "List Bullet"
+                rp.add_run(txt)
+
+        # Exact order
+        if obj:
+            add_row("Objectives", _lines(obj))
+        if prep or impl or legacy:
+            if prep or impl:
+                add_row("Time", [*( [f"Preparation: {prep}"] if prep else [] ),
+                                 *( [f"Implementation: {impl}"] if impl else [] )])
+            else:
+                add_row("Time", _lines(legacy))
+        if teach:
+            add_row("Teacher Materials", _lines(teach))
+        if stud:
+            add_row("Student Materials", _lines(stud))
+
+        if steps:
+            row = table.add_row()
+            left, right = row.cells
+            _force_cell_borders(left); _force_cell_borders(right)
+            left.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+            right.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+            left.paragraphs[0].add_run("Activity Steps").bold = True
+
+            # widths once
+            if len(table.rows) == 1:
+                try:
+                    left.width  = Inches(2.2)
+                    right.width = Inches(4.8)
+                except Exception:
+                    pass
+
+            # Step title (bold) on its own line, then body on next line(s)
+            for i, (title, body) in enumerate(steps, 1):
+                pt = right.add_paragraph()
+                run = pt.add_run(f"Step {i}: {title}")
+                run.bold = True
+                if body:
+                    for ln in _lines(body) or [body]:
+                        pb = right.add_paragraph()
+                        pb.add_run(ln)
+
+        if refl:
+            add_row("Reflection on Impact", _lines(refl), bullet=True)
+        if src:
+            add_row("Source", [_strip_md(src)])
+        if resx:
+            add_row("Resources", _lines(resx))
+
+        buf = _io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+        return buf.getvalue()
+
+    def build_docx_strategic_action(self, activity: dict) -> bytes:
+        """
+        Build the EXACT Strategic Action template (two-column, blue bold labels),
+        with numbered steps + a., b., c. substeps.
+        """
+        from docx import Document
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
+        from docx.shared import Inches, Pt
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        from docx.shared import RGBColor
+        import re as _re
+        import io as _io
+
+        BLUE = RGBColor(47, 84, 150)  # Office blue that matches your template
+
+        def _clean(s): return (s or "").strip()
+
+        def _strip_md(s: str) -> str:
+            if not s: return ""
+            t = s
+            t = _re.sub(r"```[\s\S]*?```", "", t)                # fenced code
+            t = _re.sub(r"(?m)^\s*#{1,6}\s*", "", t)            # headings
+            t = t.replace("`", "").replace("**","").replace("__","").replace("*","").replace("_","")
+            t = _re.sub(r"(?m)^\s*[•\-–]\s+", "", t)            # bullets
+            t = _re.sub(r"[ \t]+", " ", t)
+            return t.strip()
+
+        def _lines(text: str) -> list[str]:
+            text = _strip_md(text)
+            if not text: return []
+            return [p.strip() for p in _re.split(r"[\n;]+", text) if p.strip()]
+
+        # --- Extract materials blocks from Directions if embedded ---
+        def _extract_block(label_regex: str, assign_key: str, text: str) -> tuple[str, str]:
+            m = _re.search(
+                rf"(?:^|\n)\s*({label_regex})\s*:?\s*\n([\s\S]+?)"
+                rf"(?=\n\s*(Directions|Step|Steps|Introduction|Activity|Teacher|Student|Reflection|Source|Resources|Time)\b|$)",
+                text, flags=_re.I
+            )
+            if not m: return text, ""
+            block = _clean(m.group(2))
+            if block and not activity.get(assign_key):
+                activity[assign_key] = block
+            new_text = (text[:m.start()] + text[m.end():]).strip()
+            return new_text, block
+
+        def _parse_steps(act: dict) -> list[tuple[str, str, list[str]]]:
+            """
+            -> [(title, body_line, [substeps ...])]
+            Accepts Steps[] or parses Directions.
+            """
+            out: list[tuple[str, str, list[str]]] = []
+
+            steps = act.get("Steps")
+            if isinstance(steps, list) and steps:
+                for i, s in enumerate(steps, 1):
+                    title = _clean((s or {}).get("title"))
+                    body  = _clean((s or {}).get("body") or "")
+                    out.append((_strip_md(title) or f"Step {i}", _strip_md(body), []))
+                return out
+
+            dirs = _clean(act.get("Directions") or "")
+            if not dirs:
+                return out
+
+            # pull out embedded materials
+            dirs, _ = _extract_block(r"Student\s+(Materials|Supplies)", "Student Materials", dirs)
+            dirs, _ = _extract_block(r"(Materials\s+Needed|Materials|Teacher\s+Materials)", "Materials", dirs)
+            # remove a naked "Directions:" line
+            dirs = _re.sub(r"(?m)^\s*Directions\s*:?\s*$", "", dirs).strip()
+
+            lines = [l.strip() for l in dirs.splitlines() if l.strip()]
+            current_title = None
+            current_body  = []
+            current_subs  = []
+
+            def _flush():
+                if current_title is None: return
+                body = "\n".join(current_body).strip()
+                out.append((current_title, body, current_subs[:]))
+
+            for ln in lines:
+                # substep (a., b., c.)
+                msub = _re.match(r"^[a-zA-Z]\.\s+(.*)$", ln)
+                if msub and current_title is not None:
+                    current_subs.append(_strip_md(msub.group(1)))
+                    continue
+
+                m_num_title_body = _re.match(r"^\s*(?:Step\s*)?(\d+)[\.\)]\s*([^:]+?)(?::\s*(.*))?$", ln, flags=_re.I)
+                m_title_body      = _re.match(r"^([^:]+?):\s*(.*)$", ln)
+
+                if m_num_title_body:
+                    _flush()
+                    title = _strip_md(m_num_title_body.group(2))
+                    
+                    banned = {"materials needed", "materials", "student materials", "directions"}
+                    if (title or "").strip().lower() in banned:
+                        # treat as section header, not a step
+                        current_title = None
+                        current_body = []
+                        current_subs = []
+                        continue
+                    
+                    current_title = title or f"Step {len(out)+1}"
+                    current_body  = [_strip_md(m_num_title_body.group(3) or "")] if m_num_title_body.group(3) else []
+                    current_subs  = []
+                elif m_title_body:
+                    _flush()
+                    title = _strip_md(m_title_body.group(1))
+                    
+                    banned = {"materials needed", "materials", "student materials", "directions"}
+                    if (title or "").strip().lower() in banned:
+                        # treat as section header, not a step
+                        current_title = None
+                        current_body = []
+                        current_subs = []
+                        continue
+                    
+                    current_title = title or f"Step {len(out)+1}"
+                    current_body  = [_strip_md(m_title_body.group(2) or "")]
+                    current_subs  = []
+                else:
+                    if current_title is None:
+                        current_title = f"Step {len(out)+1}"
+                        current_body, current_subs = [], []
+                    current_body.append(_strip_md(ln))
+
+            _flush()
+            return out
+
+        # ---- Gather fields (and fallbacks) ----
+        name   = _clean(activity.get("Activity Name") or activity.get("Title") or "Lesson Plan")
+        obj    = _clean(activity.get("Objective"))
+        prep   = _clean(activity.get("Preparation Time"))
+        impl   = _clean(activity.get("Implementation Time"))
+        legacy = _clean(activity.get("Time"))
+        teach  = _clean(activity.get("Materials"))
+        stud   = _clean(activity.get("Student Materials"))
+        refl   = _clean(activity.get("Reflection Questions"))
+        src    = _clean(activity.get("Source Link"))
+        resx   = _clean(activity.get("Additional Resources"))
+
+        steps  = _parse_steps(activity)
+
+        # ---- Build document matching the uploaded template ----
+        doc = Document()
+
+        # Top headings
+        h0 = doc.add_heading("Strategic Action", level=0)
+        h0.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        h1 = doc.add_heading("Name of the Activity", level=1)
+        p_name = doc.add_paragraph(_strip_md(name))
+        
+        # Make headings blue and bold like the template
+        for h in (h0, h1):
+            for r in h.runs:
+                r.bold = True
+                r.font.color.rgb = BLUE
+
+        # Table skeleton
+        tbl = doc.add_table(rows=0, cols=2)
+        tbl.style = "Table Grid"      # we'll visually remove heavy borders and rely on shading/blue labels
+        tbl.alignment = WD_TABLE_ALIGNMENT.LEFT
+        tbl.autofit = False
+
+        def _force_cell_margins(cell, l=120, t=80, r=120, b=80):
+            tc = cell._tc
+            tcPr = tc.get_or_add_tcPr()
+            tcMar = tcPr.first_child_found_in("w:tcMar")
+            if tcMar is None:
+                tcMar = OxmlElement("w:tcMar")
+                tcPr.append(tcMar)
+            for tag, val in (("w:left", l), ("w:top", t), ("w:right", r), ("w:bottom", b)):
+                el = tcMar.find(qn(tag))
+                if el is None:
+                    el = OxmlElement(tag)
+                    tcMar.append(el)
+                el.set(qn("w:w"), str(val))
+                el.set(qn("w:type"), "dxa")
+
+        def _label_cell(cell, text: str):
+            p = cell.paragraphs[0]
+            r = p.add_run(text)
+            r.bold = True
+            r.font.color.rgb = BLUE
+            p.space_after = Pt(2)
+
+        def _right_cell_lines(cell, lines: list[str]):
+            if not lines: lines = [""]
+            # first paragraph reuse
+            first = True
+            for ln in lines:
+                p = cell.paragraphs[0] if first and cell.paragraphs and cell.paragraphs[0].text == "" else cell.add_paragraph()
+                first = False
+                p.add_run(_strip_md(ln))
+                p.space_after = Pt(2)
+
+        def _add_row(label: str, lines: list[str]):
+            row = tbl.add_row()
+            lc, rc = row.cells
+            _force_cell_margins(lc); _force_cell_margins(rc)
+            lc.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+            rc.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+            _label_cell(lc, label)
+            _right_cell_lines(rc, lines)
+
+        # First rows
+        if obj:
+            _add_row("Objectives", _lines(obj))
+
+        if prep or impl or legacy:
+            if prep or impl:
+                _add_row("Time", [*( [f"Preparation: {prep}"] if prep else [] ),
+                                  *( [f"Implementation: {impl}"] if impl else [] )])
+            else:
+                _add_row("Time", _lines(legacy))
+
+        if teach:
+            _add_row("Teacher Materials", _lines(teach))
+        if stud:
+            _add_row("Student Materials", _lines(stud))
+
+        # Activity Steps (special layout)
+        if steps:
+            row = tbl.add_row()
+            lc, rc = row.cells
+            _force_cell_margins(lc); _force_cell_margins(rc)
+            lc.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+            rc.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+            _label_cell(lc, "Activity Steps")
+
+            # helper: light gray shading like the template block rows
+            def _shade(cell, fill="E7E6E6"):
+                tc = cell._tc
+                tcPr = tc.get_or_add_tcPr()
+                shd = OxmlElement("w:shd")
+                shd.set(qn("w:val"), "clear")
+                shd.set(qn("w:color"), "auto")
+                shd.set(qn("w:fill"), fill)
+                tcPr.append(shd)
+
+            # render one step into a right cell
+            def _render_step(cell, idx, title, body, subs):
+                _shade(cell)
+                # Title line: number + blue bold title
+                p_title = cell.add_paragraph()
+                p_title.space_after = Pt(2)
+                p_title.add_run(f"{idx}. ")
+                r = p_title.add_run(title)
+                r.bold = True
+                r.font.color.rgb = BLUE
+
+                # Body lines
+                for ln in [l for l in (body.splitlines() if body else []) if l.strip()]:
+                    p = cell.add_paragraph()
+                    p.add_run(ln)
+                    p.space_after = Pt(2)
+
+                # Substeps a., b., c.
+                for j, s in enumerate(subs):
+                    p = cell.add_paragraph()
+                    p.paragraph_format.left_indent = Inches(0.25)
+                    p.add_run(f"{chr(ord('a') + j)}. {s}")
+
+            # first real step goes in this first row's right cell
+            first_done = False
+            for idx, (title, body, subs) in enumerate(steps, 1):
+                if not first_done:
+                    _render_step(rc, idx, title, body, subs)
+                    first_done = True
+                    continue
+
+                # subsequent steps: new table row, blank left cell, right cell has the step block
+                r2 = tbl.add_row()
+                lc2, rc2 = r2.cells
+                _force_cell_margins(lc2); _force_cell_margins(rc2)
+                lc2.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+                rc2.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+                # left cell intentionally blank (no label)
+                _render_step(rc2, idx, title, body, subs)
+
+        if refl:
+            # make them appear as a 1., 2., 3. list like your template
+            qs = [q for q in _lines(refl) if q]
+            row = tbl.add_row()
+            lc, rc = row.cells
+            _force_cell_margins(lc); _force_cell_margins(rc)
+            _label_cell(lc, "Reflection on Impact")
+            for i, q in enumerate(qs, 1):
+                p = rc.add_paragraph()
+                p.add_run(f"{i}. {q}")
+
+        if src:
+            _add_row("Source", [_strip_md(src)])
+
+        if resx:
+            _add_row("Resources", _lines(resx))
+
+        # Set widths once everything exists (keeps proportions like your template)
+        if tbl.rows:
+            try:
+                for r in tbl.rows:
+                    r.cells[0].width = Inches(2.3)
+                    r.cells[1].width = Inches(4.9)
+            except Exception:
+                pass
+
+        buf = _io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+        return buf.getvalue()
+    
+    def condense_directions_text(self, directions: str, target_steps: int | None = None, target_minutes: int | None = None) -> str:
+        try:
+            base = (directions or "").strip()
+            if not base:
+                return ""
+            goals = [
+                "Keep only essential steps, combine where possible",
+                "Short, direct sentences",
+                "Preserve safety/clarity and sequencing",
+                "Output only markdown with a numbered list; use a., b., c. for sub-steps if truly needed"
+            ]
+            if target_steps:
+                goals.insert(0, f"Target about {target_steps} numbered steps")
+            if target_minutes:
+                goals.append(f"Fit realistically within ~{target_minutes} minutes")
+
+            prompt = "You are an expert teacher editor. Rewrite the activity directions concisely.\n- " + "\n- ".join(goals) + f"\n\nOriginal Directions:\n\n{base[:4000]}"
+            from services.ai_services import openai_service
+            condensed = openai_service.chat([
+                {"role": "system", "content": "You condense classroom directions into short, clear steps."},
+                {"role": "user", "content": prompt}
+            ], max_tokens=600, temperature=0.2)
+            return (condensed or base).strip()
+        except Exception:
+            return directions
+
+    def condense_activity(self, activity: Dict[str, str]) -> Dict[str, str]:
+        """Return a shallow copy of activity with condensed Directions (and trimmed Materials)."""
+        out = dict(activity or {})
+        out["Directions"] = self.condense_directions_text(out.get("Directions", ""))
+        # Light trim of materials length; do not synthesize
+        mats = (out.get("Materials") or "").strip()
+        if len(mats) > 500:
+            out["Materials"] = mats[:500].rsplit(" ", 1)[0] + "…"
+        return out
+
+    def expand_directions_text(self, directions: str, activity_title: str = "", target_steps: int | None = None, target_minutes: int | None = None) -> str:
+        try:
+            base = (directions or "").strip()
+            goals = [
+                "Provide clear, step-by-step instructions (numbered list)",
+                "Include sub-steps where helpful (a., b., c.)",
+                "Add transitions, timing cues, and quick checks for understanding",
+                "Output only markdown; keep each step concise"
+            ]
+            if target_steps:
+                goals.insert(0, f"Target about {target_steps} numbered steps")
+            if target_minutes:
+                goals.append(f"Scope the pacing to ~{target_minutes} minutes")
+
+            prompt = (
+                f"You are an expert teacher writing detailed, classroom-ready directions for {activity_title or 'this activity'}.\n"
+                f"- " + "\n- ".join(goals) + "\n\n"
+                f"Current Directions (if any):\n\n{base[:4000]}"
+            )
+            from services.ai_services import openai_service
+            expanded = openai_service.chat([
+                {"role": "system", "content": "You expand classroom directions into detailed, step-by-step procedures."},
+                {"role": "user", "content": prompt}
+            ], max_tokens=1200, temperature=0.3)
+            return (expanded or base).strip()
+        except Exception:
+            return directions
+
+    def modify_activity_with_instruction(self, activity: Dict[str, str], instruction: str) -> Dict[str, str]:
+        """Use AI to apply free-form modifications to an activity.
+        Returns an updated activity dict, preserving unknown fields and schema.
+        """
+        import re as _re_mod  # ← local alias to avoid UnboundLocalError from any 're' shadowing
+        base = dict(activity or {})
+        try:
+            # Guardrails: provide schema and ask for strict JSON back
+            schema_hint = {
+                "Activity Name": base.get("Activity Name", ""),
+                "Objective": base.get("Objective", ""),
+                "Time": base.get("Time", ""),
+                "Materials": base.get("Materials", ""),
+                "Student Materials": base.get("Student Materials", ""),
+                "Advance preparation": base.get("Advance preparation", ""),
+                "Introduction": base.get("Introduction", ""),
+                "Directions": base.get("Directions", ""),
+                "Additional Resources": base.get("Additional Resources", ""),
+                "Source Link": base.get("Source Link", "")
+            }
+            prompt = f"""
+            You are an expert teacher editing a lesson activity. Modify the JSON activity per the user's instruction.
+            - Keep fields not mentioned as-is
+            - Make changes minimal but effective
+            - If asked to shorten directions, rewrite concisely (4–6 numbered steps)
+            - If asked to change time (e.g., "30 minutes", "make this 30 min"), update the Time field accordingly
+            - If asked to adjust tone/grade, reflect in Directions/Objective minimally
+            - Return ONLY valid JSON for the full activity object with these keys:
+              {list(schema_hint.keys())}
+
+            Instruction: \"{instruction}\"
+            Current activity JSON:\n{schema_hint}
+            """.strip()
+            from services.ai_services import openai_service
+            ai_out = openai_service.chat([
+                {"role": "system", "content": "You precisely edit activity JSON. Return only strict JSON."},
+                {"role": "user", "content": prompt}
+            ], max_tokens=1000, temperature=0.2)
+            import json
+            updated = json.loads(ai_out)
+            # Merge with base to preserve unknown fields
+            merged = dict(base)
+            for k, v in updated.items():
+                merged[k] = v
+            
+            # Force time change if instruction mentions time but AI didn't change it
+            lower_instr = (instruction or "").lower()
+            if any(word in lower_instr for word in ["minute", "min", "time", "duration"]) and "hour" not in lower_instr:
+                time_patterns = [
+                    r"(\d{1,3})\s*(?:min|mins|minutes|hour|hours|hr|hrs)",
+                    r"(\d{1,3})-?minute",
+                    r"(\d{1,3})\s*minute",
+                    r"make.*?(\d{1,3})\s*(?:min|minute)",
+                    r"change.*?to.*?(\d{1,3})\s*(?:min|minute)",
+                    r"(\d{1,3})\s*(?:min|minute).*?activity"
+                ]
+                
+                for pattern in time_patterns:
+                    time_match = _re_mod.search(pattern, lower_instr)
+                    if time_match:
+                        time_value = time_match.group(1)
+                        merged["Time"] = f"{time_value} min"
+                        break
+            # If the user asked for more detail and Directions didn't meaningfully grow, expand them explicitly
+            want_expand = any(w in (instruction or "").lower() for w in ["more detailed", "expand", "step-by-step", "add detail", "elaborate"])
+            try:
+                if want_expand:
+                    before = (base.get("Directions") or "")
+                    after = (merged.get("Directions") or "")
+                    if len(after) < max(len(before) + 50, int(len(before) * 1.15)):
+                        merged["Directions"] = self.expand_directions_text(after or before, base.get("Activity Name", ""))
+            except Exception:
+                pass
+
+            # Aggressive transforms for student-facing rewrites and grade adaptations
+            try:
+                lower_instr = (instruction or "").lower()
+                if any(p in lower_instr for p in ["student-facing", "student facing", "speak to students", "address students"]):
+                    merged["Directions"] = self.rewrite_directions_student_facing(merged.get("Directions", ""))
+                grade_match = _re_mod.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s*grade\b", lower_instr)
+                if grade_match:
+                    grade_num = int(grade_match.group(1))
+                    merged = self.adapt_for_grade_level(merged, grade_num)
+            except Exception:
+                pass
+            
+            # --- Time-aware retiming ---
+            try:
+                lower = (instruction or "").lower()
+                # only match if time units exist and not referring to grade
+                if "grade" not in lower:
+                    m = _re_mod.search(r"(\d{1,3})\s*(?:min|mins|minutes?|hr|hrs|hour|hours)", lower)
+                    if m:
+                        val = int(m.group(1))
+                        if "hr" in lower or "hour" in lower:
+                            val *= 60
+                        merged = self.retime_activity(merged, val)
+            except Exception:
+                pass
+            
+            # --- Dynamic Examples enrichment (no hard-coded content) ---
+            # Trigger if the user is asking to add examples/prompts/words/etc.
+            lower_instr = (instruction or "").lower()
+            wants_examples = _re_mod.search(r"\b(examples?|prompts?|word(?:s)?|stems?)\b", lower_instr)
+
+            if wants_examples:
+                existing = (merged.get("Examples") or "").strip()
+                existing_list = [x.strip(" •-–\t") for x in _re_mod.split(r"[\n;]+", existing) if x.strip()]
+
+                # a) user-typed example lines
+                user_lines = self._extract_bullets_from_instruction(instruction)
+
+                # b) model-inferred examples for THIS activity (no hard-coded lists)
+                model_lines = self._generate_examples_dyn(merged, instruction)
+
+                # de-dupe while preserving order
+                out, seen = [], set(x.lower() for x in existing_list)
+                for pool in (existing_list, user_lines, model_lines):
+                    for item in pool:
+                        k = item.strip()
+                        if k and k.lower() not in seen:
+                            out.append(k)
+                            seen.add(k.lower())
+
+                if out:
+                    merged["Examples"] = "\n".join(out)
+            
+            return merged
+        except Exception:
+            # Fallback: if instruction implies shortening, at least condense directions
+            if isinstance(base.get("Directions"), str) and any(w in (instruction or "").lower() for w in ["short", "shorter", "condense", "brief", "simplify", "less"]):
+                base["Directions"] = self.condense_directions_text(base.get("Directions", ""))
+            # Fallback: if instruction implies expansion, expand directions
+            if isinstance(base.get("Directions"), str) and any(w in (instruction or "").lower() for w in ["more detailed", "expand", "step-by-step", "add detail", "elaborate"]):
+                base["Directions"] = self.expand_directions_text(base.get("Directions", ""), base.get("Activity Name", ""))
+            # Fallback: time modifications - more aggressive pattern matching
+            lower_instr = (instruction or "").lower()
+            # Try multiple patterns for time extraction
+            time_patterns = [
+                r"(\d{1,3})\s*(?:min|mins|minutes|hour|hours|hr|hrs)",
+                r"(\d{1,3})-?minute",
+                r"(\d{1,3})\s*minute",
+                r"make.*?(\d{1,3})\s*(?:min|minute)",
+                r"change.*?to.*?(\d{1,3})\s*(?:min|minute)",
+                r"(\d{1,3})\s*(?:min|minute).*?activity"
+            ]
+            
+            for pattern in time_patterns:
+                time_match = _re_mod.search(pattern, lower_instr)
+                if time_match:
+                    time_value = time_match.group(1)
+                    # Default to "min" if no unit specified
+                    if "hour" in lower_instr:
+                        base["Time"] = f"{time_value} hour{'s' if int(time_value) != 1 else ''}"
+                    else:
+                        base["Time"] = f"{time_value} min"
+                    break
+            # Fallback: student-facing and grade-specific adaptations
+            if any(p in lower_instr for p in ["student-facing", "student facing", "speak to students", "address students"]):
+                base["Directions"] = self.rewrite_directions_student_facing(base.get("Directions", ""))
+            grade_match = _re_mod.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s*grade\b", lower_instr)
+            if grade_match:
+                try:
+                    base = self.adapt_for_grade_level(base, int(grade_match.group(1)))
+                except Exception:
+                    pass
+            
+            # Fallback: enrich Examples dynamically too
+            try:
+                import re as _re_fb
+                lower_instr = (instruction or "").lower()
+                if _re_fb.search(r"\b(examples?|prompts?|word(?:s)?|stems?)\b", lower_instr):
+                    existing = (base.get("Examples") or "").strip()
+                    existing_list = [x.strip(" •-–\t") for x in _re_fb.split(r"[\n;]+", existing) if x.strip()]
+                    user_lines = self._extract_bullets_from_instruction(instruction)
+                    model_lines = self._generate_examples_dyn(base, instruction)
+                    out, seen = [], set(x.lower() for x in existing_list)
+                    for pool in (existing_list, user_lines, model_lines):
+                        for item in pool:
+                            k = item.strip()
+                            if k and k.lower() not in seen:
+                                out.append(k)
+                                seen.add(k.lower())
+                    if out:
+                        base["Examples"] = "\n".join(out)
+            except Exception:
+                pass
+            
+            return base
+
+    def retime_activity(self, activity: Dict[str, str], target_minutes: int) -> Dict[str, str]:
+        """
+        Adapt Directions length and Time field to fit target_minutes using ratios.
+        - If target < baseline: condense (fewer steps)
+        - If target > baseline: expand (more steps)
+        - No hardcoded time categories; uses proportional scaling.
+        """
+        out = dict(activity or {})
+        base_minutes = _parse_minutes(out.get("Time"))
+        directions = out.get("Directions", "") or ""
+
+        # If we lack a baseline time, infer from steps with a conservative minutes/step estimate.
+        steps = _count_steps(directions) or 6
+        if not base_minutes:
+            # derive minutes per step from existing activity (keeps behavior proportional)
+            # estimate is dynamic: avg words per step influences step_time
+            words = len(directions.split())
+            avg_words_per_step = words / max(steps, 1)
+            # heuristic: 90 seconds + 1 sec per word ≈ ~ (1.5 + avg_words/60) minutes
+            est_per_step = max(1.0, 1.5 + avg_words_per_step / 60.0)
+            base_minutes = int(round(est_per_step * steps))
+
+        base_minutes = max(1, base_minutes)
+        target_minutes = max(1, int(target_minutes))
+        ratio = target_minutes / float(base_minutes)
+
+        # Compute target steps proportionally (guard rails 3..14 to keep lists readable)
+        target_steps = _clamp(int(round(steps * ratio)), 3, 14)
+
+        # Decide to condense or expand. We bias neutral band around ±10% to avoid churn.
+        if ratio < 0.9:
+            # Condense with explicit step target + time cue
+            out["Directions"] = self.condense_directions_text(
+                directions,
+                target_steps=target_steps,
+                target_minutes=target_minutes
+            )
+        elif ratio > 1.1:
+            # Expand with explicit step target + time cue
+            out["Directions"] = self.expand_directions_text(
+                directions,
+                activity_title=out.get("Activity Name", "") or out.get("Title", ""),
+                target_steps=target_steps,
+                target_minutes=target_minutes
+            )
+        # else (within ±10%), leave directions as-is; only update Time field
+
+        # Always reflect the new time field
+        unit = "min" if target_minutes < 60 or target_minutes % 60 != 0 else "hour"
+        if unit == "hour" and target_minutes % 60 == 0:
+            hrs = target_minutes // 60
+            out["Time"] = f"{hrs} hour" + ("" if hrs == 1 else "s")
+        else:
+            out["Time"] = f"{target_minutes} min"
+
+        return out
+
+    def rewrite_directions_student_facing(self, directions: str) -> str:
+        """Rewrite directions to be student-facing (you/your voice, clear, friendly)."""
+        try:
+            base = (directions or "").strip()
+            prompt = f"""
+            Convert these teacher-facing directions into student-facing instructions:
+            - Address students directly ("you", "your")
+            - Keep steps clear and concise (5–8 steps)
+            - Keep any important safety/behavior reminders
+            - Output only a numbered markdown list
+
+            Directions:\n\n{base[:4000]}
+            """.strip()
+            from services.ai_services import openai_service
+            out = openai_service.chat([
+                {"role": "system", "content": "You convert teacher directions to student-facing instructions."},
+                {"role": "user", "content": prompt}
+            ], max_tokens=800, temperature=0.2)
+            return (out or base).strip()
+        except Exception:
+            return directions
+
+    def adapt_for_grade_level(self, activity: Dict[str, str], grade: int) -> Dict[str, str]:
+        """Lightly adapt Objective and Directions language for target grade level."""
+        try:
+            out = dict(activity or {})
+            objective = out.get("Objective", "")
+            directions = out.get("Directions", "")
+            # Enforce tone constraints by grade band and require measurable changes
+            if grade <= 5:
+                style = (
+                    "Use student-facing tone (you/your). Short sentences (<= 10 words). "
+                    "Very simple vocabulary. Keep 5–7 numbered steps."
+                )
+            elif grade <= 8:
+                style = (
+                    "Use approachable tone. Short sentences (<= 14 words). "
+                    "Simple vocabulary. Keep 6–8 numbered steps."
+                )
+            else:
+                style = (
+                    "Use concise, academic tone. Sentences (<= 18 words). "
+                    "Assume independence; fewer scaffolds. Keep 4–6 numbered steps."
+                )
+
+            prompt = f"""
+            Adapt the Objective and Directions to approximately grade {grade} reading level.
+            Constraints:
+            - {style}
+            - Keep meaning and sequence; preserve safety/clarity
+            - Output ONLY JSON with keys exactly: Objective, Directions
+
+            Objective (original):\n{objective[:1000]}
+
+            Directions (original):\n{directions[:4000]}
+            """.strip()
+            from services.ai_services import openai_service
+            ai = openai_service.chat([
+                {"role": "system", "content": "You simplify educational text to a target grade level. Return only JSON."},
+                {"role": "user", "content": prompt}
+            ], max_tokens=900, temperature=0.2)
+            import json
+            j = json.loads(ai)
+            if isinstance(j, dict):
+                if isinstance(j.get("Objective"), str):
+                    out["Objective"] = j["Objective"].strip()
+                if isinstance(j.get("Directions"), str):
+                    out["Directions"] = j["Directions"].strip()
+
+            # Heuristic fallback to ensure visible change if model returned minimal edits
+            try:
+                new_dir = out.get("Directions") or directions
+                if len(new_dir.strip()) < max(len(directions.strip()) * 0.9, len(directions.strip()) - 50):
+                    # Not enough change; enforce minimal surface edits
+                    text = new_dir
+                    if grade <= 5:
+                        # Student-facing + shorter phrases
+                        text = re.sub(r"\bListen as I\b", "Listen as I", text)
+                        text = re.sub(r"\bI will\b", "You will", text)
+                        text = re.sub(r"\bExplain\b", "Say", text)
+                    elif grade >= 9:
+                        # More concise phrasing
+                        text = re.sub(r"\bListen as I\b", "Listen", text)
+                        text = re.sub(r"\bWe will\b", "You will", text)
+                    out["Directions"] = text
+            except Exception:
+                pass
+            return out
+        except Exception:
+            return activity
+
+    def format_activity_block(self, row, directions_text: str) -> Tuple[str, str, bytes, Dict[str, str]]:
+        """Format activity for display and create document"""
+        def _clean(s):
+            s = (s or "").strip()
+            return s if s else ""
+
+        def _lines(label, text):
+            t = _clean(text)
+            return [f"{label}: {t}"] if t else []
+
+        # pull fields safely
+        title = data_processor.safe_get(row, "Strategic Action") or ""
+        objective = data_processor.safe_get(row, "Objective")
+        time_str = (data_processor.safe_get(row, "Time") 
+                    or data_processor.safe_get(row, "Time to implement"))
+        materials = data_processor.safe_get(row, "Materials")
+        directions = directions_text or data_processor.safe_get(row, "Directions")
+
+        # no markdown, no duplicated title; only show non-empty sections
+        lines = []
+        lines += _lines("Objective", objective)
+        lines += _lines("Time", time_str)
+        lines += _lines("Materials", materials)
+        lines += _lines("Directions", directions)
+
+        block = "\n\n".join(lines)
+
+        # build the activity dict that will also be used to generate a docx
+        activity = {
+            "Objective": _clean(objective),
+            "Time": _clean(time_str),
+            "Materials": _clean(materials),
+            "Directions": _clean(directions),
+            "Title": _clean(title),  # keep title in the data, just don't render it in the block
+        }
+
+        filename = (title or "Activity").replace("/", "-") + ".docx"
+        
+        # Create document
+        try:
+            doc_bytes = self.build_docx_strategic_action(activity)
+        except Exception:
+            # minimal fallback: wrap the plain text into a simple .docx
+            doc_bytes = self.build_plain_docx(block)
+        
+        return block, filename, doc_bytes, activity
+
+    def build_plain_docx(self, text: str) -> bytes:
+        """Create a simple .docx from plain text as fallback"""
+        try:
+            from docx import Document
+            doc = Document()
+            doc.add_paragraph(text)
+            
+            # Save to bytes
+            import io
+            buffer = io.BytesIO()
+            doc.save(buffer)
+            return buffer.getvalue()
+        except Exception:
+            # Ultimate fallback: return empty bytes
+            return b""
+
+# Global document processor instance
+document_processor = DocumentProcessor()

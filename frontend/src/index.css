@@ -1,0 +1,145 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --primary: #3E94A5;
+  --text: #2A3B7C;
+  --accent: #EFB340;
+}
+
+body {
+  color: var(--text);
+}
+
+/* === Global rhythm & header-from-bold rules === */
+:root {
+  --base-font-size: 15px;
+  --header-scale: 1.15;
+  --subheader-scale: 1.05;
+  --line-height: 1.6;
+}
+
+html { font-size: var(--base-font-size); }
+body { line-height: var(--line-height); }
+
+/* Bold at start of paragraphs or divs becomes a header (not list items!) */
+.message-block p > strong:first-child,
+.message-block p > b:first-child,
+.message-block div > strong:first-child,
+.message-block div > b:first-child {
+  display: block; /* forces following text to a new line */
+  font-weight: 700;
+  font-size: calc(1rem * var(--header-scale)); /* header-ish */
+  line-height: 1.35;
+  margin: 0.4rem 0 0.25rem 0;
+}
+
+/* But inside list items, keep bold inline (normal weight already handled) */
+.message-block li > strong:first-child,
+.message-block li > b:first-child {
+  display: inline;
+  font-weight: 700;
+  font-size: inherit;
+}
+
+/* First paragraph's first bold: nudge slightly bigger */
+.message-block > p:first-child > strong:first-child,
+.message-block > div:first-child > strong:first-child {
+  font-size: calc(1rem * (var(--header-scale) + 0.05));
+}
+
+/* Paragraph and list spacing inside messages */
+.message-block p { margin: 0.3rem 0; }
+.message-block ul, .message-block ol { 
+  margin: 0.4rem 0 0.6rem 1.2rem;
+  padding-left: 1.5rem;
+  list-style-type: disc;
+}
+.message-block ul ul {
+  margin-top: 0.25rem;
+  margin-bottom: 0.25rem;
+}
+.message-block li { 
+  margin: 0.15rem 0;
+  line-height: 1.5;
+  display: list-item;
+  list-style-position: outside;
+}
+.message-block h2 + ul,
+.message-block h2 + * > ul {
+  margin-top: 0.5rem;
+}
+
+/* Activity title with time emoji (H1) - slightly larger than section headers */
+.message-block h1 {
+  font-size: 1.4rem !important;
+  font-weight: 700 !important;
+  margin-top: 0.5rem !important;
+  margin-bottom: 1rem !important;
+  line-height: 1.3 !important;
+}
+
+/* Heading styles for lesson plan section headers (Objective, Materials, Directions, etc.) */
+/* Section headers have bold text inside: ## **Objective** */
+/* These should be larger than numbered steps */
+.message-block h2:has(strong) {
+  font-size: 1.35rem !important;
+  font-weight: 700 !important;
+  margin-top: 1rem !important;
+  margin-bottom: 0.75rem !important;
+}
+
+/* Ensure strong text inside H2 section headers inherits the size */
+.message-block h2:has(strong) strong {
+  font-size: inherit !important;
+  font-weight: 700 !important;
+}
+
+/* Numbered steps within Directions (1. 2. 3. etc.) - no bold text inside */
+/* These are formatted as: ## 1. Prepare Bingo Cards */
+/* These should be smaller than section headers - make the difference more noticeable */
+.message-block h2:not(:has(strong)) {
+  font-size: 1.1rem !important;
+  font-weight: 700 !important;
+  margin-top: 1rem !important;
+  margin-bottom: 0.75rem !important;
+}
+
+.message-block h3 {
+  font-size: 1.25rem !important;
+  font-weight: 600 !important;
+}
+
+/* Activity header line (we'll apply this class in ActivityList) */
+.activity-header {
+  display: block;
+  font-weight: 700;
+  font-size: calc(1rem * var(--header-scale));
+  line-height: 1.35;
+  margin: 0.35rem 0 0.2rem 0;
+}
+
+/* Activity body text just a touch smaller than default body */
+.activity-body {
+  font-size: 0.95rem;
+}
+
+/* Lesson plan subheaders slightly smaller than main header style */
+.lp-subheader > strong:first-child {
+  display: block;
+  font-size: calc(1rem * var(--subheader-scale));
+  line-height: 1.35;
+  margin: 0.3rem 0 0.15rem 0;
+}
+
+/* Keep your button look the same */
+.btn-primary {
+  background: var(--primary);
+  color: white;
+  border-radius: 0.375rem;
+  padding: 0.5rem 1rem;
+}
+.btn-primary:hover { opacity: 0.9; }
+
+

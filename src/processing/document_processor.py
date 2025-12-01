@@ -1,0 +1,1419 @@
+# processing/document_processor.py
+"""
+Document processing and generation
+"""
+import io
+import re
+import hashlib
+import json
+from typing import Dict, Tuple, List, Any, Optional
+from dataclasses import dataclass, field
+from docx import Document
+from docx.shared import Inches
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from services.ai_services import openai_service
+from data.processor import data_processor
+
+def _parse_minutes(value: str | None) -> int | None:
+    if not value:
+        return None
+    import re
+    m = re.search(r"(\d{1,3})\s*(?:min|mins|minutes?|hr|hrs|hour|hours)", str(value).lower())
+    if not m:
+        return None
+    n = int(m.group(1))
+    if "hr" in value.lower() or "hour" in value.lower():
+        n *= 60
+    return n
+
+def _count_steps(directions: str) -> int:
+    if not directions:
+        return 0
+    import re
+    nums = re.findall(r"^\s*\d+\.", directions, flags=re.M)
+    if nums:
+        return len(nums)
+    lines = [ln.strip() for ln in directions.splitlines() if ln.strip()]
+    return len(lines)
+
+def _clamp(n: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, n))
+
+def _norm_text(s: str) -> str:
+    s = re.sub(r"\s+", " ", (s or "").strip().lower())
+    return s
+
+def _hash_text(s: str) -> str:
+    return hashlib.sha1(_norm_text(s).encode("utf-8")).hexdigest()
+
+@dataclass
+class Activity:
+    id: str
+    title: str
+    time_minutes: int | None = None
+    sections: Dict[str, Any] = field(default_factory=lambda: {
+        "intro": "",
+        "objectives": [],
+        "materials": [],
+        "directions": [],
+        "examples": [],
+        "discussion_questions": [],
+        "assessment": [],
+        "notes": ""
+    })
+    meta: Dict[str, Any] = field(default_factory=dict)
+    version: int = 1
+
+    def upsert_text_section(self, key: str, text: str) -> None:
+        self.sections[key] = (text or "").strip()
+        self.version += 1
+
+    def upsert_list_section(self, key: str, items: List[str]) -> None:
+        existing = [x for x in (self.sections.get(key) or []) if isinstance(x, str)]
+        seen = {_hash_text(x) for x in existing}
+        out = existing[:]
+        for it in (items or []):
+            h = _hash_text(it)
+            if h not in seen:
+                out.append(it.strip())
+                seen.add(h)
+        self.sections[key] = out
+        self.version += 1
+
+    def replace_list_section(self, key: str, items: List[str]) -> None:
+        seen, out = set(), []
+        for it in (items or []):
+            h = _hash_text(it)
+            if h not in seen:
+                out.append(it.strip())
+                seen.add(h)
+        self.sections[key] = out
+        self.version += 1
+
+    def to_markdown(self) -> str:
+        lines = []
+        title_line = f"# {self.title}"
+        if self.time_minutes:
+            title_line += f"  ⏱️ {self.time_minutes} min"
+        lines.append(title_line)
+
+        if self.sections.get("intro"):
+            lines.append(f"\n**Overview**\n{self.sections['intro']}")
+
+        def add_list(name, key):
+            vals = self.sections.get(key) or []
+            if vals:
+                lines.append(f"\n**{name}**")
+                for v in vals:
+                    lines.append(f"- {v}")
+
+        add_list("Objectives", "objectives")
+        add_list("Materials", "materials")
+        add_list("Directions", "directions")
+        add_list("Examples", "examples")
+        add_list("Discussion Questions", "discussion_questions")
+        add_list("Assessment", "assessment")
+
+        if self.sections.get("notes"):
+            lines.append(f"\n**Notes**\n{self.sections['notes']}")
+
+        return "\n".join(lines)
+
+def strip_added_headers(text: str) -> str:
+    text = re.sub(r"(#+\s*)?Added to .*?\n", "", text, flags=re.I)
+    text = re.sub(r"(#+\s*)?Added Content:?[\s\n]*", "", text, flags=re.I)
+    return text
+
+def parse_legacy_activity(legacy: Dict[str, Any]) -> Activity:
+    title = legacy.get("title") or legacy.get("Strategic Action") or "Untitled Activity"
+    raw_time = legacy.get("Time") or legacy.get("Time to implement") or ""
+    time_minutes = None
+    m = re.search(r"(\d{1,3})\s*min", str(raw_time).lower())
+    if m:
+        time_minutes = int(m.group(1))
+
+    act = Activity(
+        id=str(legacy.get("id") or hashlib.md5(title.encode()).hexdigest()),
+        title=title,
+        time_minutes=time_minutes,
+        meta={"source": "legacy"}
+    )
+
+    mats = legacy.get("Materials") or legacy.get("Materials Needed") or ""
+    dirs = legacy.get("Directions") or legacy.get("Steps") or ""
+    exs  = legacy.get("Examples") or ""
+
+    def split_bullets(text: str) -> List[str]:
+        if not text:
+            return []
+        parts = re.split(r"(?:^\s*[-•]\s+|\n\s*[-•]\s+)", text.strip(), flags=re.M)
+        return [p.strip() for p in parts if p.strip()]
+
+    def split_steps(text: str) -> List[str]:
+        if not text:
+            return []
+        parts = re.split(r"(?:^\s*\d+\.\s+|\n\s*\d+\.\s+)", text.strip(), flags=re.M)
+        return [p.strip() for p in parts if p.strip()]
+
+    act.upsert_text_section("intro", legacy.get("Overview") or legacy.get("Description") or "")
+    act.replace_list_section("materials", split_bullets(mats))
+    act.replace_list_section("directions", split_steps(dirs))
+    if isinstance(exs, str):
+        act.replace_list_section("examples", split_bullets(exs))
+    elif isinstance(exs, list):
+        act.replace_list_section("examples", exs)
+
+    return act
+
+class DocumentProcessor:
+    
+    def __init__(self):
+        pass
+
+    def _is_expand_intent(self, instruction: str) -> bool:
+        import re as _re_intent
+        return bool(_re_intent.search(
+            r"\b(expand|lengthen|elaborate|add (detail|details)|more detailed|step[-\s]*by[-\s]*step)\b",
+            (instruction or ""), flags=_re_intent.I
+        ))
+
+    def _is_shorten_intent(self, instruction: str) -> bool:
+        import re as _re_intent
+        return bool(_re_intent.search(
+            r"\b(shorten|condense|summariz(?:e|e it)|make .*shorter|trim|brief|simplify)\b",
+            (instruction or ""), flags=_re_intent.I
+        ))
+
+    def _as_text(self, v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, list):
+            return "\n".join(self._as_text(x) for x in v)
+        if isinstance(v, dict):
+            import json as _json
+            return _json.dumps(v, ensure_ascii=False)
+        return str(v)
+
+    def autofill_from_directions(self, activity: dict):
+        directions = activity.get("Directions", "")
+        if not directions:
+            return
+        
+        import re as _re
+        text = self._as_text(directions).strip()
+        
+        patterns = [
+            r"objective[:\s]+([^.\n]+)",
+            r"goal[:\s]+([^.\n]+)", 
+            r"students will ([^.\n]+)",
+            r"learn(?:ing)? (?:to )?([^.\n]+)",
+            r"understand(?:ing)? ([^.\n]+)",
+        ]
+        
+        for pattern in patterns:
+            m = _re.search(pattern, text, _re.I)
+            if m:
+                obj = m.group(1).strip()
+                if len(obj) > 10 and len(obj) < 200:
+                    activity["Objective"] = obj
+                    return
+        
+        first_sentence = text.split('.')[0].strip()
+        if len(first_sentence) > 10 and len(first_sentence) < 200:
+            activity["Objective"] = first_sentence
+
+    def legacy_to_markdown(self, activity: Dict[str, str]) -> str:
+        """
+        Format activity as markdown.
+        Now uses Python template instead of LLM for consistency and speed.
+        """
+        # Use the new template-based formatting
+        return self.format_activity_template(activity)
+    
+    def _format_directions_with_bullets(self, text: str) -> str:
+        """Format directions as proper numbered steps with sub-bullets"""
+        import re
+        
+        # Split into lines
+        lines = text.split('\n')
+        formatted_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                formatted_lines.append("")
+                continue
+
+            # Detect numbered steps (1., 2., Step 1, etc.)
+            if re.match(r'^(\d+\.|\d+\)|Step \d+)', line):
+                # Main step
+                formatted_lines.append(f"\n{line}")
+            
+            # Detect lettered sub-steps (a., b., etc.)
+            elif re.match(r'^([a-z]\.|\([a-z]\))', line):
+                # Sub-step - indent with bullet
+                cleaned = re.sub(r'^[a-z]\.|^\([a-z]\)', '', line).strip()
+                formatted_lines.append(f"   - {cleaned}")
+            
+            # Detect bullet points (*, -, •)
+            elif re.match(r'^[\*\-•]', line):
+                cleaned = re.sub(r'^[\*\-•]\s*', '', line).strip()
+                formatted_lines.append(f"   - {cleaned}")
+            
+            # Regular text - keep as is
+            else:
+                formatted_lines.append(f"   {line}")
+        
+        return "\n".join(formatted_lines)
+    
+    def _format_as_bullets(self, text: str) -> str:
+        """Format materials list as bullets"""
+        import re
+        
+        # If already has bullets/numbers, clean them up
+        lines = text.split('\n')
+        formatted = []
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Remove existing bullets/numbers
+            cleaned = re.sub(r'^[\*\-•\d+\.]\s*', '', line).strip()
+            if cleaned:
+                formatted.append(f"- {cleaned}")
+        
+        return "\n".join(formatted)
+    
+    def _parse_json_directions(self, text: str) -> str:
+        """
+        Parse directions that were returned as JSON string back to hierarchical format.
+        
+        Input: '{"1": "Main step", "1.a": "Sub step", ...}'
+        Output: '1. Main step\n   a. Sub step\n...'
+        """
+        import json
+        import re
+        
+        # Check if text looks like JSON
+        if not (text.strip().startswith('{') or text.strip().startswith('[')):
+            return text
+        
+        try:
+            # Try to parse as JSON
+            data = json.loads(text)
+            
+            if not isinstance(data, dict):
+                return text
+            
+            # Group by main step number
+            steps = {}
+            for key, value in sorted(data.items()):
+                # Extract step number (e.g., "1" from "1" or "1.a")
+                match = re.match(r'^(\d+)(?:\.([a-z]))?$', str(key))
+                if not match:
+                    continue
+                
+                main_num = match.group(1)
+                sub_letter = match.group(2)
+                
+                if main_num not in steps:
+                    steps[main_num] = {'main': None, 'subs': []}
+                
+                if sub_letter:
+                    steps[main_num]['subs'].append((sub_letter, value))
+                else:
+                    steps[main_num]['main'] = value
+            
+            # Format as hierarchical text
+            lines = []
+            for num in sorted(steps.keys(), key=int):
+                step_data = steps[num]
+                
+                if step_data['main']:
+                    lines.append(f"\n{num}. {step_data['main']}")
+                
+                for letter, text in step_data['subs']:
+                    lines.append(f"   {letter}. {text}")
+            
+            return '\n'.join(lines).strip()
+            
+        except (json.JSONDecodeError, ValueError, KeyError):
+            # Not valid JSON, return as-is
+            return text
+    
+    def _format_directions_smart(self, text: str) -> str:
+        """
+        Smart formatting for Directions section.
+        Converts to markdown-compatible format: numbered main steps with bulleted sub-steps.
+        """
+        import re
+        
+        # ✅ HANDLE DICT INPUT: Convert to string if needed
+        if isinstance(text, dict):
+            print(f"⚠️  [FORMAT] Directions is a dict, converting to string")
+            if 'Directions' in text:
+                text = str(text['Directions'])
+            else:
+                import json
+                text = json.dumps(text, indent=2)
+        
+        # Convert to string if not already
+        text = str(text) if text is not None else ""
+        
+        # ✅ HANDLE JSON-FORMATTED DIRECTIONS: Parse back to hierarchical format
+        if text.strip().startswith('{'):
+            print(f"🔄 [FORMAT] Directions is JSON, parsing to hierarchical format")
+            text = self._parse_json_directions(text)
+
+        # 🔍 DEBUG: Print raw input
+        print("=" * 80)
+        print("🔍 [DEBUG] RAW DIRECTIONS INPUT:")
+        print("=" * 80)
+        print(f"Type: {type(text)}, Length: {len(text)}")
+        print(repr(text[:500] if len(text) > 500 else text))
+        print("=" * 80)
+
+        if not text or not text.strip():
+            return ""
+        
+        # ⚡ CRITICAL: Check if already formatted with ## headings
+        # If so, return as-is to avoid double-formatting
+        if re.search(r'^##\s+\d+\.', text, re.MULTILINE):
+            print("⚡ [SKIP] Directions already formatted with ## headings - returning as-is")
+            return text
+        
+        # Check if already has hierarchical numbering
+        has_numbers = bool(re.search(r'^\s*\d+\.', text, re.MULTILINE))
+        has_letters = bool(re.search(r'^\s+[a-z]\.', text, re.MULTILINE))
+        
+        # If already has numbers and letters, convert letters to bullets
+        if has_numbers and has_letters:
+            print("🔄 [FORMAT] Converting a. b. c. to bullets")
+            lines = text.split('\n')
+            formatted_lines = []
+            in_substeps = False
+            
+            for line in lines:
+                stripped_line = line.rstrip()
+                
+                # Check if it's a main step (starts with number)
+                if re.match(r'^\d+\.', stripped_line):
+                    # Close previous sub-steps list if open
+                    if in_substeps:
+                        formatted_lines.append("")  # Add blank line after list
+                        in_substeps = False
+                    
+                    # Extract number and title
+                    match = re.match(r'^(\d+)\.\s+(.+)$', stripped_line)
+                    if match:
+                        num = match.group(1)
+                        title = match.group(2)
+                        formatted_lines.append(f"\n## {num}. {title}")  # Use H2 heading (same size as Directions)
+                    else:
+                        formatted_lines.append(stripped_line)
+                # Check if it's a lettered sub-step
+                elif re.match(r'^\s+[a-z]\.', stripped_line):
+                    if not in_substeps:
+                        in_substeps = True
+                    cleaned = re.sub(r'^\s+[a-z]\.\s*', '', stripped_line)
+                    formatted_lines.append(f"- {cleaned}")  # Use standard bullet (no extra indentation)
+                else:
+                    # Close sub-steps list if we hit a non-substep line
+                    if in_substeps:
+                        formatted_lines.append("")  # Add blank line after list
+                        in_substeps = False
+                    if stripped_line:  # Only add non-empty lines
+                        formatted_lines.append(stripped_line)
+            
+            # Close any remaining sub-steps list
+            if in_substeps:
+                formatted_lines.append("")
+            
+            return '\n'.join(formatted_lines)
+        
+        # If only has numbers, return as-is
+        if has_numbers:
+            return text
+        
+        # Otherwise, try to add structure (existing logic)
+        lines = text.split('\n')
+        groups = []
+        current_group = []
+        
+        for line in lines:
+            stripped = line.strip()
+            
+            if not stripped:
+                if current_group:
+                    groups.append(current_group)
+                    current_group = []
+            else:
+                current_group.append(stripped)
+        
+        if current_group:
+            groups.append(current_group)
+        
+        # If we didn't get logical groups, try to detect them differently
+        if len(groups) < 2:
+            groups = []
+            current_group = []
+            
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+
+                is_title = (
+                    len(stripped) < 80 and
+                    stripped[0].isupper() and
+                    not stripped.endswith('.') and
+                    len(stripped.split()) <= 6
+                )
+                
+                if is_title and current_group and len(current_group) > 0:
+                    groups.append(current_group)
+                    current_group = [stripped]
+                else:
+                    current_group.append(stripped)
+            
+            if current_group:
+                groups.append(current_group)
+        
+        # Format each group with numbering
+        formatted_lines = []
+        main_step = 0
+        
+        for group in groups:
+            if not group:
+                continue
+
+            main_step += 1
+            title = group[0]
+            substeps = group[1:] if len(group) > 1 else []
+            
+            # Add main step
+            formatted_lines.append("")
+            formatted_lines.append(f"{main_step}. **{title}**")  # Bold title
+            
+            # Add sub-steps with bullets (not letters!)
+            for substep in substeps:
+                formatted_lines.append(f"   - {substep}")  # Use bullets
+        
+        result = '\n'.join(formatted_lines).strip()
+        
+        # Fallback: if couldn't detect structure, return original
+        if main_step == 0:
+            return text
+        
+        return result
+    def format_activity_template(self, activity: Dict[str, str]) -> str:
+        """
+        Format activity as markdown using a Python template (no LLM needed).
+        Fast, free, and always consistent.
+        Automatically adds hierarchical numbering to Directions if missing.
+        """
+        import re
+        
+        # Extract fields
+        title = activity.get("Activity Name") or activity.get("Title") or "Lesson Plan"
+        time = activity.get("Time", "")
+        objective = activity.get("Objective", "")
+        overview = activity.get("Overview") or activity.get("Description") or activity.get("Introduction", "")
+        materials = activity.get("Materials") or activity.get("Materials Needed", "")
+        student_materials = activity.get("Student Materials", "")
+        advance_prep = activity.get("Advance preparation", "")
+        directions = activity.get("Directions") or activity.get("Steps", "")
+        examples = activity.get("Examples", "")
+        reflection = activity.get("Reflection Questions") or activity.get("Reflection on Impact") or activity.get("Reflection", "")
+        modifications = activity.get("Modification Suggestions", "")
+        resources = activity.get("Additional Resources", "")
+        source = activity.get("Source Link") or activity.get("Link to Resource") or activity.get("Resources Needed", "")
+        
+        # Build markdown
+        lines = []
+        
+        # Title with time emoji
+        title_line = f"# {title}"
+        if time:
+            title_line += f" ⏱️ {time}"
+        lines.append(title_line)
+        lines.append("")
+        
+        # Overview
+        if overview:
+            lines.append("**Overview**")
+            lines.append(overview)
+            lines.append("")
+        
+        # Objective
+        if objective:
+            lines.append("## **Objective**")
+            lines.append(objective)
+            lines.append("")
+        
+        # Materials
+        if materials:
+            lines.append("## **Materials**")
+            formatted_materials = self._format_as_bullets(materials)
+            lines.append(formatted_materials)
+            lines.append("")
+        
+        # Student Materials
+        if student_materials:
+            lines.append("**Student Materials**")
+            formatted_student_materials = self._format_as_bullets(student_materials)
+            lines.append(formatted_student_materials)
+            lines.append("")
+        
+        # Advance Preparation
+        if advance_prep:
+            lines.append("**Advance Preparation**")
+            lines.append(advance_prep)
+            lines.append("")
+        
+        # Directions (ENHANCED - automatically add hierarchical numbering)
+        if directions:
+            lines.append("## **Directions**")
+            lines.append("")  # ← ADD BLANK LINE BEFORE DIRECTIONS
+            formatted_directions = self._format_directions_smart(directions)
+            lines.append(formatted_directions)
+            lines.append("")
+        
+        # Examples
+        if examples:
+            lines.append("**Examples**")
+            if isinstance(examples, str):
+                formatted_examples = self._format_as_bullets(examples)
+                lines.append(formatted_examples)
+            else:
+                lines.append(str(examples))
+            lines.append("")
+        
+        # Reflection Questions
+        if reflection:
+            lines.append("## **Reflection Questions**")
+            formatted_reflection = self._format_as_bullets(reflection)
+            lines.append(formatted_reflection)
+            lines.append("")
+        
+        # Modification Suggestions
+        if modifications:
+            lines.append("## **Modification Suggestions**")
+            lines.append(modifications)
+            lines.append("")
+        
+        # Additional Resources
+        if resources:
+            lines.append("**Additional Resources**")
+            lines.append(resources)
+            lines.append("")
+        
+        # Source Link
+        if source:
+            lines.append("**Source**")
+            lines.append(source)
+            lines.append("")
+        
+        result = "\n".join(lines).strip()
+        
+        # 🔍 DEBUG: Print final markdown
+        print("=" * 80)
+        print("🔍 [DEBUG] FINAL MARKDOWN OUTPUT:")
+        print("=" * 80)
+        print(result[:1000])  # First 1000 chars
+        print("=" * 80)
+        
+        return result
+    
+    def markdown_to_dict(self, markdown: str) -> Dict[str, str]:
+        """Parse markdown back into activity dictionary format"""
+        import re
+        
+        activity = {}
+        
+        # Extract title and time from H1
+        title_match = re.search(r'^#\s+(.+?)(?:\s+⏱️\s*(.+?))?$', markdown, re.MULTILINE)
+        if title_match:
+            title = title_match.group(1).strip()
+            time_str = title_match.group(2).strip() if title_match.group(2) else ""
+            activity["Activity Name"] = title
+            activity["Title"] = title
+            if time_str:
+                activity["Time"] = time_str
+        
+        # Extract Objective (handle both plain and **bold** formats)
+        objective_match = re.search(r'##\s+\*{0,2}Objective\*{0,2}\s*\n(.*?)(?=\n##|\Z)', markdown, re.DOTALL | re.IGNORECASE)
+        if objective_match:
+            activity["Objective"] = objective_match.group(1).strip()
+        
+        # Extract Materials Needed (handle both plain and **bold** formats)
+        materials_match = re.search(r'##\s+\*{0,2}Materials(?:\s+Needed|\s+Required)?\*{0,2}\s*\n(.*?)(?=\n##|\Z)', markdown, re.DOTALL | re.IGNORECASE)
+        if materials_match:
+            materials_content = materials_match.group(1).strip()
+            activity["Materials"] = materials_content
+            activity["Materials Needed"] = materials_content
+        
+        # ✅ FIXED: Extract Directions (handle both plain and **bold** formats)
+        directions_match = re.search(r'##\s+\*{0,2}Directions\*{0,2}\s*\n(.*?)(?=\n##\s+\*{0,2}[A-Z]|\Z)', markdown, re.DOTALL | re.IGNORECASE)
+        if directions_match:
+            directions_content = directions_match.group(1).strip()
+            activity["Directions"] = directions_content
+            activity["Steps"] = directions_content
+            print(f"✅ [PARSE] Extracted Directions: {len(directions_content)} chars")
+        else:
+            print(f"⚠️  [PARSE] No Directions section found in markdown")
+        
+        # Extract Reflection Questions (handle both plain and **bold** formats)
+        reflection_match = re.search(r'##\s+\*{0,2}Reflection\s*(?:Questions?)?\*{0,2}\s*\n(.*?)(?=\n##|\Z)', markdown, re.DOTALL | re.IGNORECASE)
+        if reflection_match:
+            activity["Reflection Questions"] = reflection_match.group(1).strip()
+        
+        # Extract Modification Suggestions (handle both plain and **bold** formats)
+        mod_match = re.search(r'##\s+\*{0,2}Modification\s+Suggestions?\*{0,2}\s*\n(.*?)(?=\n##|\Z)', markdown, re.DOTALL | re.IGNORECASE)
+        if mod_match:
+            activity["Modification Suggestions"] = mod_match.group(1).strip()
+        
+        # If no structured sections found, store the whole markdown as Content
+        if len(activity) <= 2:  # Only has title/time
+            activity["Content"] = markdown
+            print(f"⚠️  [PARSE] No sections found, storing as raw content")
+        
+        return activity
+    
+    def modify_activity(
+        self, 
+        row_index: int, 
+        instruction: str,
+        conversation_history: List[Dict] = None
+    ) -> Tuple[str, str]:
+        """Modify activity using smart modifier with validation"""
+        
+        print(f"🔍 [DEBUG] Full modification for: {instruction}")
+        
+        # Load original activity from cache
+        from data.content_cache import content_cache
+        lesson_plan_md, summary = content_cache.get_generated(row_index)
+        if not lesson_plan_md:
+            return "", "Activity not found"
+        
+        base_activity = self.markdown_to_dict(lesson_plan_md)
+        print(f"✅ [DEBUG] Loaded original_activity from cache: {list(base_activity.keys())}")
+        
+        # Get source content
+        source_content, _ = content_cache.get(row_index)
+        source_content = source_content or ""
+        print(f"✅ [DEBUG] Retrieved source content: {len(source_content)} chars")
+        
+        # Preserve original title
+        original_title = base_activity.get('Title', '')
+        print(f"🔒 [MODIFY] Preserving original title: '{original_title}'")
+        
+        # ========== USE SMART MODIFIER ==========
+        from processing.smart_modifier import smart_modifier
+        
+        modified_activity = smart_modifier.modify_activity(
+            activity=base_activity.copy(),
+            user_request=instruction,
+            source_content=source_content,
+            conversation_history=conversation_history or [],
+            original_activity=base_activity.copy()  # Pass original activity for context
+        )
+        # =========================================
+        
+        # ✅ Check if validation failed
+        if modified_activity.get("needs_clarification"):
+            print(f"⚠️ [CLARIFICATION] {modified_activity.get('clarification_message')}")
+            return {
+                "error": "clarification_needed",
+                "clarification_needed": True,
+                "clarification_message": modified_activity.get("clarification_message"),
+                "validation_reason": modified_activity.get("validation_reason"),
+                "validation_status": modified_activity.get("validation_status")
+            }
+        
+        # Only proceed if validation passed
+        # Ensure title is preserved
+        modified_activity['Title'] = original_title
+        
+        # Apply formatting template
+        print(f"🔧 [MODIFY] Post-processing: Applying formatting template...")
+        formatted_md = self.format_activity_template(modified_activity)
+        
+        # Validate title preservation
+        final_activity = self.markdown_to_dict(formatted_md)
+        print(f"✅ [MODIFY] Title preserved: '{final_activity.get('Title', '')}'")
+        
+        return formatted_md, f"Modified: {instruction}"
+    
+    def make_directions(self, page_text: str, activity_title: str, activity_data: dict = None) -> str:
+        if not page_text.strip():
+            if activity_data:
+                return self._generate_directions_from_activity_data(activity_title, activity_data)
+            else:
+                return "No source material available for generating directions."
+        
+        prompt = f"""You are an expert teacher creating clear, step-by-step directions for a classroom activity.
+        
+        Activity: {activity_title}
+        
+        Source material:
+        {page_text[:2000]}
+        
+### CRITICAL FORMATTING REQUIREMENTS:
+
+**Directions MUST use hierarchical numbering:**
+
+CORRECT FORMAT (always use this):
+1. Main step title
+   a. First detailed sub-step with full explanation
+   b. Second detailed sub-step with full explanation
+   c. Third detailed sub-step with full explanation
+
+2. Next main step title
+   a. Another detailed sub-step
+   b. Another detailed sub-step
+   c. Another detailed sub-step
+
+INCORRECT FORMATS (never use):
+1. **Bold Step**: Description  ← Wrong!
+* Bullet point  ← Wrong!
+- Dash point  ← Wrong!
+
+Rules:
+- Use numbers (1. 2. 3.) for main steps
+- Use lowercase letters (a. b. c.) for sub-steps
+- Indent sub-steps with exactly 3 spaces: "   a. "
+- Minimum 3-5 main steps
+- Each main step MUST have at least 2-3 sub-steps
+- Be detailed and specific in each sub-step
+- Full sentences, no ellipses (...)
+- No truncation
+
+Create detailed, actionable directions following the format above.
+        """
+        
+        try:
+            return openai_service.chat([
+                {"role": "system", "content": "You are an expert teacher creating clear classroom directions. You ALWAYS use hierarchical numbering (1. a. b. c.) for directions."},
+                {"role": "user", "content": prompt}
+            ], max_tokens=2000, temperature=0.3)
+        except Exception:
+            return "Error generating directions. Please refer to source material."
+    
+    def _generate_directions_from_activity_data(self, activity_title: str, activity_data: dict) -> str:
+        try:
+            objective = activity_data.get("Objective", "")
+            materials = activity_data.get("Materials", "")
+            time = activity_data.get("Time", "")
+            notes = activity_data.get("Notes", "")
+            short_desc = activity_data.get("Short Description", "")
+            
+            context_parts = []
+            if objective:
+                context_parts.append(f"Objective: {objective}")
+            if short_desc:
+                context_parts.append(f"Description: {short_desc}")
+            if notes:
+                context_parts.append(f"Notes: {notes}")
+            if time:
+                context_parts.append(f"Time: {time}")
+            if materials:
+                context_parts.append(f"Materials: {materials}")
+            
+            context = "\n".join(context_parts)
+            
+            prompt = f"""You are an expert teacher creating clear, step-by-step directions for a classroom activity.
+            
+            Activity: {activity_title}
+            
+            Available information:
+            {context}
+            
+### CRITICAL FORMATTING REQUIREMENTS:
+
+**Directions MUST use hierarchical numbering:**
+
+CORRECT FORMAT (always use this):
+1. Main step title
+   a. First detailed sub-step with full explanation
+   b. Second detailed sub-step with full explanation
+   c. Third detailed sub-step with full explanation
+
+2. Next main step title
+   a. Another detailed sub-step
+   b. Another detailed sub-step
+   c. Another detailed sub-step
+
+INCORRECT FORMATS (never use):
+1. **Bold Step**: Description  ← Wrong!
+* Bullet point  ← Wrong!
+- Dash point  ← Wrong!
+
+Rules:
+- Use numbers (1. 2. 3.) for main steps
+- Use lowercase letters (a. b. c.) for sub-steps
+- Indent sub-steps with exactly 3 spaces: "   a. "
+- Minimum 3-5 main steps
+- Each main step MUST have at least 2-3 sub-steps
+- Be detailed and specific in each sub-step
+- Full sentences, no ellipses (...)
+- No truncation
+
+Create detailed, actionable directions following the format above.
+            """
+            
+            from services.ai_services import openai_service
+            return openai_service.chat([
+                {"role": "system", "content": "You are an expert teacher creating clear classroom directions. You ALWAYS use hierarchical numbering (1. a. b. c.) for directions."},
+                {"role": "user", "content": prompt}
+            ], max_tokens=2000, temperature=0.3)
+            
+        except Exception as e:
+            return f"Error generating directions from activity data: {str(e)[:100]}..."
+    
+    def modify_activity_with_instruction(
+        self,
+        activity: Dict[str, str],
+        instruction: str,
+        source_content: Optional[str] = None
+    ) -> Dict[str, str]:
+        """
+        Modifies an activity based on user instruction using pure LLM modification.
+        Handles ANY modification request intelligently without hardcoded logic.
+        """
+        # ====================================================================
+        # PURE LLM MODIFICATION - No hardcoded cases, handles everything
+        # ====================================================================
+        from services.ai_services import openai_service
+        import json
+        import re
+
+        base_activity = dict(activity or {})
+
+        original_title = (base_activity.get("Activity Name") or
+                          base_activity.get("Title") or
+                          "Untitled Activity")
+        original_time = (base_activity.get("Time") or
+                         base_activity.get("Duration") or
+                         base_activity.get("Time to implement"))
+
+        print(f"🔒 [MODIFY] Preserving original title: '{original_title}'")
+
+        time_pattern = re.compile(
+            r'\b(make it|change to|adjust to|set to|convert to|shorten to|extend to|reduce to)\s+'
+            r'(\d+)\s*(min|mins|minute|minutes|hour|hours|hr|hrs)\b',
+            re.IGNORECASE
+        )
+        time_match = time_pattern.search((instruction or "").lower())
+        is_time_change = time_match is not None
+
+        source_context = ""
+        if source_content and len(source_content) > 100:
+            truncated = source_content[:2000]
+            ellipsis = "..." if len(source_content) > 2000 else ""
+            source_context = (
+                "\n### Source Material (for reference only):\n"
+                f"{truncated}{ellipsis}"
+                "\n\nUse the source material to add accurate details, but DO NOT change the activity name.\n"
+            )
+
+        prompt = f"""You are modifying an educational activity based on a teacher's request.
+
+### Current Activity:
+{json.dumps(base_activity, indent=2)}
+
+{source_context}
+
+### Teacher's Request:
+{instruction}
+
+### CRITICAL FORMATTING RULES:
+
+1. **PRESERVE THE ACTIVITY NAME**: Must remain "{original_title}"
+
+2. **DIRECTIONS MUST USE HIERARCHICAL NUMBERING**:
+   
+   CORRECT FORMAT (always use this):
+   1. Main step description
+      a. Detailed sub-step explanation
+      b. Another detailed sub-step explanation
+      c. Third detailed sub-step explanation
+   
+   2. Next main step
+      a. Detailed sub-step
+      b. Another sub-step
+   
+   INCORRECT FORMATS (never use):
+   1. **Bold Step**: Description  ← Wrong!
+   * Bullet point  ← Wrong!
+   - Dash point  ← Wrong!
+   
+   Rules:
+   - Use numbers (1. 2. 3.) for main steps
+   - Use lowercase letters (a. b. c.) for sub-steps
+   - Indent sub-steps with exactly 3 spaces: "   a. "
+   - Minimum 2-3 sub-steps per main step
+   - Be detailed and specific
+
+3. **CONTENT LENGTH RULES**:
+   
+   **IF USER ASKS TO SHORTEN/CONDENSE/TRIM:**
+   - Your PRIMARY goal is to make directions 40-50% SHORTER
+   - Combine steps where possible (e.g., merge steps 1 & 2 if related)
+   - Remove ALL redundant explanations and examples
+   - Cut elaborative phrases like "For example", "This shows", "Make sure to"
+   - Use concise, direct language
+   - Keep ONLY core instructions needed to run the activity
+   - Target final length: 40-50% of original
+   - NO ellipses (...), NO "etc." - write complete but brief sentences
+   
+   **FOR ALL OTHER REQUESTS:**
+   - DO NOT shorten content unless explicitly asked
+   - KEEP all steps and details
+   - When asked to "simplify", use plain language but KEEP all content
+   - When adapting for grade levels, KEEP length but change vocabulary
+   - Add more detail if needed
+   - NO ellipses (...), NO truncation
+
+4. **GRADE LEVEL ADAPTATIONS - THE GOLDEN RULE**:
+
+   ⚠️ **STRUCTURE STAYS THE SAME. LANGUAGE CHANGES.**
+   
+   When adapting for kindergarten/elementary/middle school/high school:
+   
+   **ALWAYS PRESERVE:**
+   ✅ Exact number of main steps (if original has 4 steps → adaptation has 4 steps)
+   ✅ Exact number of sub-steps under each main step (if 1.a, 1.b, 1.c → keep a, b, c)
+   ✅ Same depth of explanation and detail
+   ✅ Same comprehensive coverage of the topic
+   ✅ All learning objectives
+   
+   **ONLY CHANGE:**
+   ✅ Vocabulary complexity (simple words for younger, advanced for older)
+   ✅ Sentence structure (short for younger, complex for older)
+   ✅ Examples and references (age-appropriate)
+   ✅ Level of scaffolding (more guidance for younger)
+   ✅ Expected independence (teacher-led for younger, self-directed for older)
+   
+   **GRADE-SPECIFIC VOCABULARY GUIDELINES:**
+   
+   **Kindergarten (Ages 5-6):**
+   - Use 1-2 syllable words when possible
+   - Short, simple sentences (5-10 words)
+   - Concrete, visual examples (pictures, toys, games)
+   - Add: "with pictures", "ask a grown-up", "use stickers/charts"
+   - Examples: "tiny steps" not "manageable tasks", "think about" not "reflect on"
+   
+   **Elementary (Grades 3-5):**
+   - Use 2-3 syllable words, some academic vocabulary
+   - Medium sentences (10-15 words)
+   - Mix of concrete and abstract examples
+   - Add: "use a calendar", "ask for help when needed", "keep a log"
+   - Examples: "make a plan" not "develop a strategy", "think about results" not "conduct evaluation"
+   
+   **Middle School (Grades 6-8):**
+   - Use academic vocabulary, define technical terms
+   - Longer sentences with some complexity (15-20 words)
+   - Abstract concepts with real-world connections
+   - Add: "track your progress", "adjust if needed", "seek support"
+   - Examples: "assess your needs", "measurable goals", "SMART criteria"
+   
+   **High School (Grades 9-12):**
+   - Use advanced vocabulary and discipline-specific terms
+   - Complex sentences with multiple clauses (20+ words)
+   - Abstract thinking, analytical frameworks
+   - Add: "systematic approach", "data-driven assessment", "metacognitive awareness"
+   - Examples: "conduct self-assessment", "strategic planning", "root cause analysis"
+   
+   **CONCRETE EXAMPLE OF CORRECT ADAPTATION:**
+   
+   Original (Middle School):
+   1. Identify Your Goal
+      a. Assess your personal and academic needs
+      b. Choose a specific, measurable goal
+      c. Ensure it meets SMART criteria
+   
+   Kindergarten (SAME STRUCTURE, SIMPLER LANGUAGE):
+   1. Pick Your Goal
+      a. Think about what you want to get better at
+      b. Choose one goal you can see and count
+      c. Make sure it's not too easy and not too hard
+   
+   Elementary (SAME STRUCTURE, MEDIUM LANGUAGE):
+   1. Choose Your Goal
+      a. Think about what you want to improve
+      b. Make your goal specific and easy to measure
+      c. Check if your goal is SMART (explain what each letter means)
+   
+   High School (SAME STRUCTURE, ADVANCED LANGUAGE):
+   1. Define Your Objective
+      a. Conduct a comprehensive self-assessment of growth areas
+      b. Formulate a specific, quantifiable goal with precise metrics
+      c. Validate your goal against SMART criteria with supporting rationale
+   
+   **NOTICE:** All three have the SAME structure (1 step with a, b, c sub-steps), just different words!
+   
+   **CHARACTER COUNT REQUIREMENT:**
+   
+   When adapting for grade levels, the adapted version should be AT LEAST 80% the length of the original.
+   
+   If original Directions = 2866 characters, kindergarten adaptation should be ≥ 2293 characters (80%).
+   
+   How to maintain length while using simpler words:
+   ✅ Add more explanation and detail for younger students
+   ✅ Include step-by-step scaffolding ("First... then... next...")
+   ✅ Add concrete examples for each sub-step
+   ✅ Include visual/tactile support suggestions ("use pictures", "draw it", "use toys")
+   ✅ Spell out abbreviations and explain concepts fully
+   
+   Example - Notice the kindergarten version is LONGER because it adds explanation:
+   
+   Middle School (45 chars):
+   "Choose a specific goal that is measurable."
+   
+   Kindergarten (95 chars):
+   "Choose one special goal that you can see and count. For example, if you want to learn to read, you could say 'I want to read 5 books this month.'"
+   
+   CRITICAL: More detail for younger students = similar or greater character count!
+
+5. **SIMPLIFICATION REQUESTS**:
+   - "Simplify" means use plain, easy words
+   - "Simplify" does NOT mean make it shorter
+   - Replace complex terms with simple terms
+   - Keep all steps, just make them easier to understand
+   - Add clarifying examples if helpful
+   
+   Example:
+   - Complex: "Facilitate metacognitive discourse around pedagogical paradigms"
+   - Simplified: "Help students talk about different ways to teach and learn"
+   - (SAME meaning, SIMPLER words, SAME length)
+
+### SHORTENING SELF-CHECK (If user asked to shorten):
+
+If the user requested to shorten, condense, or trim the directions, you MUST verify:
+
+1. ✅ Original Directions length: {len(str(base_activity.get('Directions', '')))} chars
+2. ✅ My shortened Directions length: ___ chars  
+3. ✅ Reduction achieved: (my chars / {len(str(base_activity.get('Directions', '')))}) = ___% of original
+4. ✅ Target: 40-50% of original length
+
+**CRITICAL CHECK:**
+- If your shortened version is MORE than 60% of original length, you DID NOT shorten enough!
+- Go back and cut MORE content:
+  - Merge similar steps together
+  - Remove ALL examples and elaborations
+  - Use 1-2 sentence descriptions instead of 3-4 sentences
+  - Cut any "For instance", "For example", "This helps", "Make sure" phrases
+  - Be ruthlessly concise while keeping core instructions
+
+**EXAMPLE OF PROPER SHORTENING:**
+
+Original (178 words):
+"1. Introduction to Identity
+   a. Begin the lesson by explaining the concept of identity. Discuss how everyone has multiple identities that include gender, race, ethnicity, religion, disability, family structure, home language, and personal interests. Emphasize that identity is complex and cannot be determined solely by appearance. For example, a student might identify as a Hispanic girl who practices Christianity, has a disability, speaks both English and Spanish at home, and loves to play soccer.
+   b. Encourage students to think about their own identities and how these aspects shape their interactions with the world. Ask for a few examples from the class to illustrate different identities.
+   c. Introduce the My Many Identities handout and explain that students will use it to reflect on their own identities."
+
+Shortened (68 words - 38% of original):
+"1. Introduction to Identity
+   a. Explain that identity includes gender, race, ethnicity, religion, disability, family structure, language, and interests. Show that people have multiple identities that aren't visible.
+   b. Have students share examples of their own identities.
+   c. Distribute the My Many Identities handout for students to complete."
+
+**Notice:** Shortened version is 38% of original, removes examples, combines related ideas, uses direct language.
+
+### Your Task:
+Modify the activity according to the request while following ALL rules above.
+
+### MANDATORY SELF-CHECK (Complete BEFORE responding):
+
+Before you return your JSON response, verify:
+
+1. ✅ Activity name is still "{original_title}"
+2. ✅ If this is a grade adaptation:
+   - Count main steps: Original has ___ steps, my adaptation has ___ steps (MUST BE EQUAL)
+   - Count sub-steps: Original has ___ sub-steps, my adaptation has ___ sub-steps (MUST BE EQUAL)  
+   - Count characters: Original Directions has {len(str(base_activity.get('Directions', '')))} chars, my adaptation has ___ chars
+   - Length ratio calculation: (my chars / {len(str(base_activity.get('Directions', '')))} chars) = ___% (MUST BE ≥80%)
+
+3. ✅ If length ratio is below 80%, you MUST ADD MORE DETAIL:
+   - Add concrete examples to each sub-step
+   - Add "For example..." clarifications after key points
+   - Add visual/tactile support suggestions ("draw a picture", "use counting blocks")
+   - Add step-by-step breakdowns ("First... Then... Next... Finally...")
+   - Spell out processes more explicitly for the grade level
+
+**WARNING:** If your adaptation is less than 80% of original length ({len(str(base_activity.get('Directions', '')))} × 0.80 = {int(len(str(base_activity.get('Directions', ''))) * 0.80)} chars minimum), you MUST revise and add more content before returning JSON!
+
+Return ONLY valid JSON. No markdown, no explanations.
+"""
+
+        try:
+            response = openai_service.chat(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an expert at modifying educational activities with these MANDATORY rules:\n"
+                            "1. ALWAYS preserve the original activity name\n"
+                            "2. For grade-level adaptations: PRESERVE exact structure (same number of steps and sub-steps)\n"
+                            "3. For grade-level adaptations: Adapted version MUST be ≥80% the character length of the original\n"
+                            "4. Achieve length by adding MORE detail, examples, and scaffolding for younger students\n"
+                            "5. VERIFY your response meets these requirements BEFORE returning JSON"
+                        )
+                    },
+                {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=3500,
+                temperature=0.3
+            )
+
+            modified = json.loads(response)
+
+            # ====================================================================
+            # POST-PROCESSING: Apply proper formatting to Directions
+            # This ensures hierarchical numbering (1. a. b. c.) is converted to 
+            # markdown-compatible format (headings + bullets)
+            # ====================================================================
+            print(f"🔧 [MODIFY] Post-processing: Applying formatting template...")
+            
+            # Step 1: Convert the JSON back to markdown using format_activity_template
+            # This will run Directions through _format_directions_smart()
+            temp_markdown = self.format_activity_template(modified)
+            
+            # Step 2: Parse the formatted markdown back to dict
+            # This ensures we have properly formatted Directions with bullets instead of letters
+            modified = self.markdown_to_dict(temp_markdown)
+            
+            print(f"✅ [MODIFY] Formatting applied - Directions: {len(modified.get('Directions', ''))} chars")
+
+            # ====================================================================
+            # FAILSAFE: Force title preservation
+            # ====================================================================
+            modified["Activity Name"] = original_title
+            if "Title" in modified:
+                modified["Title"] = original_title
+            if "Strategic Action" in base_activity:
+                modified["Strategic Action"] = original_title
+
+            print(f"✅ [MODIFY] Title preserved: '{modified.get('Activity Name')}'")
+
+            # ====================================================================
+            # FAILSAFE: Validate step count for grade-level adaptations  
+            # ====================================================================
+            grade_keywords = ['kindergarten', 'elementary', 'middle school', 'high school',
+                              'grade', 'adapt for', 'appropriate for']
+            is_grade_adaptation = any(keyword in instruction.lower() for keyword in grade_keywords)
+
+            if is_grade_adaptation:
+                import re
+                
+                def count_hierarchical_steps(text):
+                    """Count main steps and sub-steps in directions"""
+                    if not text:
+                        return 0, 0
+                    
+                    # Count main steps (lines starting with number followed by period)
+                    main_steps = len(re.findall(r'^\d+\.\s', text, re.MULTILINE))
+                    
+                    # Count sub-steps (lines with letter+period OR dashes after spaces)
+                    sub_steps = len(re.findall(r'^\s+[a-z]\.\s', text, re.MULTILINE))
+                    sub_steps += len(re.findall(r'^\s+-\s', text, re.MULTILINE))
+                    
+                    return main_steps, sub_steps
+                
+                # Count steps in original
+                original_dirs = base_activity.get("Directions", "")
+                orig_main, orig_sub = count_hierarchical_steps(original_dirs)
+                
+                # Count steps in modified  
+                modified_dirs = modified.get("Directions", "")
+                mod_main, mod_sub = count_hierarchical_steps(modified_dirs)
+                
+                print(f"🔍 [VALIDATION] Grade adaptation:")
+                print(f"   Original: {orig_main} main steps, {orig_sub} sub-steps, {len(original_dirs)} chars")
+                print(f"   Modified: {mod_main} main steps, {mod_sub} sub-steps, {len(modified_dirs)} chars")
+                
+                # Calculate length ratio
+                length_ratio = len(modified_dirs) / len(original_dirs) if len(original_dirs) > 0 else 0
+                print(f"   Length ratio: {length_ratio:.2f} (target: ≥0.80)")
+                
+                # Validate structure preservation
+                if mod_main < orig_main:
+                    print(f"⚠️  [VALIDATION] Warning: Main steps reduced from {orig_main} to {mod_main}")
+                if mod_sub < orig_sub * 0.8:  # Allow 20% tolerance for reformatting
+                    print(f"⚠️  [VALIDATION] Warning: Sub-steps significantly reduced from {orig_sub} to {mod_sub}")
+                if length_ratio < 0.80:
+                    print(f"⚠️  [VALIDATION] Warning: Content length is only {length_ratio:.0%} of original (should be ≥80%)")
+
+            # ====================================================================
+            # Handle time modifications
+            # ====================================================================
+            if is_time_change and time_match:
+                new_time_value = int(time_match.group(2))
+                unit = time_match.group(3).lower()
+
+                if 'hour' in unit or 'hr' in unit:
+                    new_minutes = new_time_value * 60
+                else:
+                    new_minutes = new_time_value
+
+                if new_minutes >= 60:
+                    hours = new_minutes // 60
+                    mins = new_minutes % 60
+                    if mins > 0:
+                        time_str = f"{hours} hour{'s' if hours != 1 else ''} {mins} min"
+                    else:
+                        time_str = f"{hours} hour{'s' if hours != 1 else ''}"
+                else:
+                    time_str = f"{new_minutes} min"
+
+                modified["Time"] = time_str
+                if "Duration" in modified:
+                    modified["Duration"] = time_str
+
+                print(f"⏱️  [MODIFY] Updated time to: {time_str}")
+            else:
+                # Preserve original time if no time change requested
+                if original_time:
+                    modified.setdefault("Time", original_time)
+
+            return modified
+            
+        except Exception as e:
+            print(f"❌ [MODIFY] Error modifying activity: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            fallback = base_activity.copy()
+            fallback["Activity Name"] = original_title
+            if "Title" in fallback:
+                fallback["Title"] = original_title
+            return fallback
+
+    def build_docx(self, activity: Dict[str, str]) -> bytes:
+        """Build docx - delegates to build_docx_strategic_action"""
+        return self.build_docx_strategic_action(activity)
+
+    def build_docx_strategic_action(self, activity: dict) -> bytes:
+        """Simplified DOCX builder - returns basic formatted document"""
+        from docx import Document
+        from docx.shared import Inches
+        import io as _io
+
+        doc = Document()
+        doc.add_heading("Strategic Action", level=0)
+        
+        title = activity.get("Activity Name") or activity.get("Title") or "Lesson Plan"
+        doc.add_heading(title, level=1)
+        
+        fields = [
+            ("Objective", activity.get("Objective")),
+            ("Time", activity.get("Time")),
+            ("Materials", activity.get("Materials")),
+            ("Student Materials", activity.get("Student Materials")),
+            ("Directions", activity.get("Directions")),
+            ("Reflection Questions", activity.get("Reflection Questions")),
+            ("Source Link", activity.get("Source Link")),
+            ("Additional Resources", activity.get("Additional Resources"))
+        ]
+        
+        for label, value in fields:
+            if value:
+                doc.add_heading(label, level=2)
+                doc.add_paragraph(str(value))
+
+        buf = _io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+        return buf.getvalue()
+    
+    def build_plain_docx(self, text: str) -> bytes:
+        """Create a simple .docx from plain text as fallback"""
+        try:
+            from docx import Document
+            doc = Document()
+            doc.add_paragraph(text)
+            
+            import io
+            buffer = io.BytesIO()
+            doc.save(buffer)
+            buffer.seek(0)
+            return buffer.getvalue()
+        except Exception:
+            return b""
+
+    def format_activity_block(self, row, directions_text: str) -> Tuple[str, str, bytes, Dict[str, str]]:
+        def _get(row, *keys, default=""):
+            from data.processor import data_processor
+            for k in keys:
+                v = data_processor.safe_get(row, k)
+                if v is not None and str(v).strip() != "":
+                    return self._as_text(v)
+            return default
+
+        title = _get(row, "Strategic Action", "Activity Name", "Title") or "Lesson Plan"
+        objective = _get(row, "Objective", "Objectives")
+        teacher_mats = _get(row, "Materials", "Teacher Materials", "Materials Needed")
+        student_mats = _get(row, "Student Materials", "Student materials", "Student Supplies")
+        reflection = _get(row, "Reflection Questions", "Reflection on Impact", "Reflection")
+        source = _get(row, "Source Link", "Source", "Link")
+        resources = _get(row, "Additional Resources", "Resources")
+        time_str = _get(row, "Time", "Time to implement")
+        prep_time = _get(row, "Preparation Time", "Prep Time")
+        impl_time = _get(row, "Implementation Time", "Implement Time")
+        directions_raw = _get(row, "Directions", "Steps")
+
+        if directions_text is not None and directions_text != "":
+            directions_raw = self._as_text(directions_text)
+
+        activity = {
+            "Activity Name": title,
+            "Title": title,
+            "Objective": objective,
+            "Materials": teacher_mats,
+            "Student Materials": student_mats,
+            "Reflection Questions": reflection,
+            "Source Link": source,
+            "Additional Resources": resources,
+            "Time": time_str,
+            "Preparation Time": prep_time,
+            "Implementation Time": impl_time,
+            "Directions": directions_raw,
+        }
+
+        if not activity["Objective"] and activity["Directions"]:
+            self.autofill_from_directions(activity)
+
+        block = "\n\n".join(
+            f"{label}: {val}" for label, val in [
+                ("Objective", activity["Objective"]),
+                ("Time", time_str or (prep_time or impl_time)),
+                ("Teacher Materials", teacher_mats),
+                ("Student Materials", student_mats),
+                ("Directions", directions_raw),
+                ("Reflection on Impact", reflection),
+                ("Source", source),
+                ("Resources", resources),
+            ] if val
+        )
+
+        filename = (title or "Activity").replace("/", "-") + ".docx"
+        
+        try:
+            doc_bytes = self.build_docx_strategic_action(activity)
+        except Exception:
+            doc_bytes = self.build_plain_docx(block)
+        
+        return block, filename, doc_bytes, activity
+
+
+# Global document processor instance
+document_processor = DocumentProcessor()

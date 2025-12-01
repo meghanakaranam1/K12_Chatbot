@@ -1,0 +1,14 @@
+services:
+  # Python Backend Service
+  - type: web
+    name: chatbot-backend
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn src.api.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: OPENAI_API_KEY
+        sync: false  # You will be asked to enter this in the Render dashboard
