@@ -1,6 +1,3 @@
-// components/ActivityList.tsx
-import React from 'react'
-
 interface Activity {
   row_index: number
   title: string
